@@ -4,31 +4,21 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+#include <SDL2/SDL.h>
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
-
-void save_img(unsigned char *buf, int wrap, int xsize, int ysize, char *filename) {
-	FILE *f = fopen(filename, "wb");
-	fprintf(f, "P5\n%d %d\n%d\n", xsize, ysize, 255);
-	for (int i = 0; i < ysize; i++) {
-		fwrite(buf + i * wrap, 1, xsize, f);
-	}
-	fclose(f);
-}
-
-void flush_frame(AVCodecContext *ctx, AVFrame *frame, char *filename) {
-	char buf[1024] = {};
-	snprintf(buf, sizeof(buf), filename, ctx->frame_num);
-	save_img(frame->data[0], frame->linesize[0], frame->width, frame->height, buf);
-}
+#include <libavutil/pixdesc.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
 
 int main(int argc, char **argv) {
 	if (argc < 2) {
 		printf("expected file to open\n");
 		return 1;
 	}
-
 	char *filename = argv[1];
+
+	SDL_Init(SDL_INIT_VIDEO);
 
 	AVFormatContext *fmt_ctx = NULL;
 	if (avformat_open_input(&fmt_ctx, filename, NULL, NULL) < 0) {
@@ -66,42 +56,66 @@ int main(int argc, char **argv) {
 		printf("could not open codec\n");
 		return 1;
 	}
-	printf("got %s\n", codec->name);
 
-	char *out_filename = "/tmp/test%d.ppm";
+	SDL_Window *window = SDL_CreateWindow(
+		"Viewer", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+		ctx->width / 2, ctx->height / 2, SDL_WINDOW_OPENGL | SDL_WINDOW_ALLOW_HIGHDPI
+	);
+	SDL_GL_SetSwapInterval(1);
 
-	uint64_t inbuf_size = 4096;
-	uint8_t *in_buffer = calloc(1, inbuf_size + AV_INPUT_BUFFER_PADDING_SIZE);
-	uint8_t *buffer = calloc(1, 1024);
+	SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC | SDL_RENDERER_TARGETTEXTURE);
+	SDL_Texture *texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_YV12, SDL_TEXTUREACCESS_STREAMING, ctx->width, ctx->height);
+
+	struct SwsContext *sws_ctx = sws_getContext(ctx->width, ctx->height, ctx->pix_fmt, ctx->width, ctx->height, AV_PIX_FMT_YUV420P, SWS_BILINEAR, NULL, NULL, NULL);
+
+	int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_YUV420P, ctx->width, ctx->height, 32);
+	uint8_t *rgb_buffer = (uint8_t *)av_malloc(num_bytes);
+
+	AVFrame *rgb_frame = av_frame_alloc();
+	av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, rgb_buffer, AV_PIX_FMT_YUV420P, ctx->width, ctx->height, 32);
 
 	AVPacket *pkt = av_packet_alloc();
 	AVFrame *frame = av_frame_alloc();
+	while (av_read_frame(fmt_ctx, pkt) >= 0) {
+		if (pkt->stream_index != video_stream_idx) {
+			goto end;
+		}
 
-	 while (av_read_frame(fmt_ctx, pkt) >= 0) {
-        if (pkt->stream_index == video_stream_idx) {
-            if (avcodec_send_packet(ctx, pkt) < 0) {
-				printf("failed to send packet?\n");
+		if (avcodec_send_packet(ctx, pkt) < 0) {
+			printf("Error sending packet for decoding\n");
+			return 1;
+		}
+
+		int ret = 0;
+		do {
+			ret = avcodec_receive_frame(ctx, frame);
+			if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+				break;
+			} else if (ret < 0) {
+				printf("decode error!\n");
 				return 1;
-            }
+			}
 
-            while (avcodec_receive_frame(ctx, frame) >= 0) {
-				flush_frame(ctx, frame, out_filename);
-                av_frame_unref(frame);
-            }
-        }
-        av_packet_unref(pkt);
-    }
+			sws_scale(sws_ctx, (uint8_t const * const *)frame->data, frame->linesize, 0, ctx->height, rgb_frame->data, rgb_frame->linesize);
 
-    avcodec_send_packet(ctx, NULL);
-    while (avcodec_receive_frame(ctx, frame) >= 0) {
-		flush_frame(ctx, frame, out_filename);
-        av_frame_unref(frame);
-    }
+			SDL_Rect rect = (SDL_Rect){.x = 0, .y = 0, .w = ctx->width, .h = ctx->height};
+			SDL_UpdateYUVTexture(texture, &rect, rgb_frame->data[0], rgb_frame->linesize[0], rgb_frame->data[1], rgb_frame->linesize[1], rgb_frame->data[2], rgb_frame->linesize[2]);
+			SDL_RenderClear(renderer);
+			SDL_RenderCopy(renderer, texture, NULL, NULL);
+			SDL_RenderPresent(renderer);
+		} while (ret >= 0);
+end:
+		av_packet_unref(pkt);
 
-    av_packet_free(&pkt);
-    av_frame_free(&frame);
-    avcodec_free_context(&ctx);
-    avformat_close_input(&fmt_ctx);
+		SDL_Event event;
+		SDL_PollEvent(&event);
+		switch (event.type) {
+			case SDL_QUIT: {
+				SDL_Quit();
+				return 0;
+			} break;
+		}
+	}
 
 	return 0;
 }

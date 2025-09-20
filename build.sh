@@ -1,1 +1,1 @@
-clang -o rolledit -g -O0 $(pkg-config --cflags --libs libavformat) $(pkg-config --cflags --libs libavcodec) main.c
+clang -o rolledit -g -O0 -I/opt/homebrew/include -L/opt/homebrew/lib -L/usr/local/lib -rpath /usr/local/lib -lSDL2 -lavformat -lavcodec -lswscale -lavutil main.c
