@@ -74,6 +74,9 @@ int main(int argc, char **argv) {
 	AVFrame *rgb_frame = av_frame_alloc();
 	av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, rgb_buffer, AV_PIX_FMT_YUV420P, ctx->width, ctx->height, 32);
 
+	double fps = av_q2d(fmt_ctx->streams[video_stream_idx]->r_frame_rate);
+	double sleep_time = 1.0 / fps;
+
 	AVPacket *pkt = av_packet_alloc();
 	AVFrame *frame = av_frame_alloc();
 	while (av_read_frame(fmt_ctx, pkt) >= 0) {
@@ -97,6 +100,8 @@ int main(int argc, char **argv) {
 			}
 
 			sws_scale(sws_ctx, (uint8_t const * const *)frame->data, frame->linesize, 0, ctx->height, rgb_frame->data, rgb_frame->linesize);
+
+			SDL_Delay((1000 * sleep_time) - 10);
 
 			SDL_Rect rect = (SDL_Rect){.x = 0, .y = 0, .w = ctx->width, .h = ctx->height};
 			SDL_UpdateYUVTexture(texture, &rect, rgb_frame->data[0], rgb_frame->linesize[0], rgb_frame->data[1], rgb_frame->linesize[1], rgb_frame->data[2], rgb_frame->linesize[2]);
