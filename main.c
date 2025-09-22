@@ -44,20 +44,13 @@ Queue queue_init(void) {
 	return q;
 }
 
-void queue_push(Queue *q, void *data) {
+bool queue_push(Queue *q, void *data) {
 	pthread_mutex_lock(&q->lock);
 
 	int64_t cur_size = (int64_t)q->tail - (int64_t)q->head;
 	if (cur_size >= q->size) {
-		int64_t new_size = q->size * 2;
-		void **new_list = calloc(sizeof(void *), new_size);
-
-		for (uint32_t i = q->head; i < q->tail; i++) {
-			new_list[i % new_size] = q->list[i % q->size];
-		}
-		free(q->list);
-		q->list = new_list;
-		q->size = new_size;
+		pthread_mutex_unlock(&q->lock);
+		return false;
 	}
 
 	uint32_t wrapped_tail = q->tail % q->size; 
@@ -65,6 +58,7 @@ void queue_push(Queue *q, void *data) {
 	q->tail += 1;
 
 	pthread_mutex_unlock(&q->lock);
+	return true;
 }
 
 void *queue_pop(Queue *q) {
@@ -126,6 +120,12 @@ typedef struct {
 	Queue frames;
 	Queue samples;
 } PlaybackState;
+
+void sleep_ns(uint64_t ns) {
+	struct timespec requested_time = (struct timespec){.tv_nsec = ns};
+	struct timespec remaining_time = {};
+	nanosleep(&requested_time, &remaining_time);
+}
 
 void *decode_video(void *userdata) {
 	PlaybackState *state = (PlaybackState *)userdata;
@@ -241,7 +241,9 @@ void *decode_video(void *userdata) {
 				av_image_fill_arrays(f->buffers, f->strides, f->pixels, AV_PIX_FMT_YUV420P, state->width, state->height, 32);
 				sws_scale(sws_ctx, (uint8_t const * const *)frame->data, frame->linesize, 0, video_ctx->height, f->buffers, f->strides);
 
-				queue_push(&state->frames, (void *)f);
+				while (!queue_push(&state->frames, (void *)f)) {
+					sleep_ns(1);
+				}
 			} while (ret >= 0);
 		} else if (pkt->stream_index == audio_stream_idx) {
 			if (avcodec_send_packet(audio_ctx, pkt) < 0) {
@@ -279,7 +281,10 @@ void *decode_video(void *userdata) {
 
 				Sample *s = (Sample *)malloc(sizeof(Sample));
 				*s = (Sample){.data = audio_buf, .size = total_size_bytes};
-				queue_push(&state->samples, (void *)s);
+
+				while (!queue_push(&state->samples, (void *)s)) {
+					sleep_ns(1);
+				}
 			} while (ret >= 0);
 		} else {
 			av_packet_unref(pkt);
