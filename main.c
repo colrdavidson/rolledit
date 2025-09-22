@@ -106,8 +106,10 @@ typedef struct {
 } Sample;
 
 typedef struct {
-	AVFrame *f;
-	int64_t pts_us;
+	uint8_t *pixels;
+	uint8_t *buffers[4];
+	int      strides[4];
+	int64_t  pts_us;
 } Frame;
 
 typedef struct {
@@ -207,14 +209,6 @@ void *decode_video(void *userdata) {
 
 	struct SwsContext *sws_ctx = sws_getContext(video_ctx->width, video_ctx->height, video_ctx->pix_fmt, state->width, state->height, AV_PIX_FMT_YUV420P, SWS_BICUBIC, NULL, NULL, NULL);
 
-	int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_YUV420P, state->width, state->height, 32);
-	uint8_t *rgb_buffer = (uint8_t *)av_malloc(num_bytes);
-
-	AVFrame *rgb_frame = av_frame_alloc();
-	av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, rgb_buffer, AV_PIX_FMT_YUV420P, state->width, state->height, 32);
-
-	double fps = av_q2d(video_stream->r_frame_rate);
-
 	AVPacket *pkt = av_packet_alloc();
 	AVFrame *frame = av_frame_alloc();
 	while (av_read_frame(fmt_ctx, pkt) >= 0) {
@@ -239,10 +233,14 @@ void *decode_video(void *userdata) {
 					pts = av_rescale_q(frame->best_effort_timestamp, video_stream->time_base, AV_TIME_BASE_Q);
 				}
 
-				sws_scale(sws_ctx, (uint8_t const * const *)frame->data, frame->linesize, 0, video_ctx->height, rgb_frame->data, rgb_frame->linesize);
+				int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_YUV420P, state->width, state->height, 32);
+				Frame *f = (Frame *)calloc(1, sizeof(Frame));
+				f->pts_us = pts;
+				f->pixels = malloc(num_bytes);
 
-				Frame *f = (Frame *)malloc(sizeof(Frame));
-				*f = (Frame){.f = rgb_frame, .pts_us = pts};
+				av_image_fill_arrays(f->buffers, f->strides, f->pixels, AV_PIX_FMT_YUV420P, state->width, state->height, 32);
+				sws_scale(sws_ctx, (uint8_t const * const *)frame->data, frame->linesize, 0, video_ctx->height, f->buffers, f->strides);
+
 				queue_push(&state->frames, (void *)f);
 			} while (ret >= 0);
 		} else if (pkt->stream_index == audio_stream_idx) {
@@ -268,11 +266,8 @@ void *decode_video(void *userdata) {
 					AV_ROUND_UP
 				);
 
-				uint8_t *audio_buf = NULL;
-				if (av_samples_alloc(&audio_buf, NULL, state->channels, dst_samples, state->sample_fmt, 1) < 0) {
-					printf("failed to alloc destination samples\n");
-					return NULL;
-				}
+				int audio_buf_size = av_samples_get_buffer_size(NULL, state->channels, dst_samples, state->sample_fmt, 1);
+				uint8_t *audio_buf = calloc(1, audio_buf_size);
 
 				int dst_chan_sample_count = swr_convert(swr, &audio_buf, dst_samples * state->channels, (const uint8_t **)frame->data, frame->nb_samples);
 				if (dst_chan_sample_count < 0) {
@@ -342,6 +337,9 @@ int main(int argc, char **argv) {
 	int64_t start_time = av_gettime();
 
 	for (;;) {
+		int64_t cur_time_us = av_gettime();
+		int64_t rescaled_time_us = cur_time_us - start_time;
+
 		SDL_Event event;
 		SDL_PollEvent(&event);
 		switch (event.type) {
@@ -354,27 +352,23 @@ int main(int argc, char **argv) {
 		Sample *sample = (Sample *)queue_pop(&pb.samples);
 		if (sample != NULL) {
 			SDL_QueueAudio(audio_dev, sample->data, sample->size);
+			free(sample->data);
 			free(sample);
 		}
 
 		Frame *frame = (Frame *)queue_peek(&pb.frames);
 		if (frame != NULL) {
-			int64_t cur_time = av_gettime() - start_time;
-
-			if (cur_time >= frame->pts_us) {
-				printf("\e[0;31m%lld | updating frame\e[0m\n", cur_time);
-
+			if (rescaled_time_us >= frame->pts_us) {
 				SDL_Rect rect = (SDL_Rect){.x = 0, .y = 0, .w = pb.width, .h = pb.height};
 				SDL_UpdateYUVTexture(texture, &rect,
-					frame->f->data[0], frame->f->linesize[0],
-					frame->f->data[1], frame->f->linesize[1],
-					frame->f->data[2], frame->f->linesize[2]
+					frame->buffers[0], frame->strides[0],
+					frame->buffers[1], frame->strides[1],
+					frame->buffers[2], frame->strides[2]
 				);
 
+				free(frame->pixels);
 				Frame *used_frame = queue_pop(&pb.frames);
 				free(used_frame);
-			} else {
-				printf("%lld | skipping frame\n", cur_time);
 			}
 		}
 
