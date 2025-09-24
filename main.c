@@ -46,10 +46,14 @@ Queue queue_init(void) {
 	return q;
 }
 
+int64_t queue_size_unsafe(Queue *q) {
+	return (int64_t)q->tail - (int64_t)q->head;
+}
+
 bool queue_push(Queue *q, void *data) {
 	pthread_mutex_lock(&q->lock);
 
-	int64_t cur_size = (int64_t)q->tail - (int64_t)q->head;
+	int64_t cur_size = queue_size_unsafe(q);
 	if (cur_size >= q->size) {
 		pthread_mutex_unlock(&q->lock);
 		return false;
@@ -63,57 +67,63 @@ bool queue_push(Queue *q, void *data) {
 	return true;
 }
 
-void *queue_pop(Queue *q) {
-	pthread_mutex_lock(&q->lock);
-
-	int64_t cur_size = (int64_t)q->tail - (int64_t)q->head;
+void *queue_pop_unsafe(Queue *q) {
+	int64_t cur_size = queue_size_unsafe(q);
 	if (cur_size <= 0) {
-		pthread_mutex_unlock(&q->lock);
 		return NULL;
 	}
 
 	uint32_t wrapped_head = q->head % q->size; 
 	void *data = q->list[wrapped_head];
 	q->head += 1;
+	return data;
+}
 
+void *queue_peek_unsafe(Queue *q) {
+	int64_t cur_size = queue_size_unsafe(q);
+	if (cur_size <= 0) {
+		return NULL;
+	}
+
+	uint32_t wrapped_head = q->head % q->size; 
+	void *data = q->list[wrapped_head];
+	return data;
+}
+
+void *queue_pop(Queue *q) {
+	pthread_mutex_lock(&q->lock);
+	void *data = queue_pop_unsafe(q);
 	pthread_mutex_unlock(&q->lock);
 	return data;
 }
 
 void *queue_peek(Queue *q) {
 	pthread_mutex_lock(&q->lock);
-
-	int64_t cur_size = (int64_t)q->tail - (int64_t)q->head;
-	if (cur_size <= 0) {
-		pthread_mutex_unlock(&q->lock);
-		return NULL;
-	}
-
-	uint32_t wrapped_head = q->head % q->size; 
-	void *data = q->list[wrapped_head];
-
+	void *data = queue_peek_unsafe(q);
 	pthread_mutex_unlock(&q->lock);
 	return data;
 }
 
 int64_t queue_size(Queue *q) {
 	pthread_mutex_lock(&q->lock);
-	int64_t cur_size = (int64_t)q->tail - (int64_t)q->head;
+	int64_t cur_size = queue_size_unsafe(q);
 	pthread_mutex_unlock(&q->lock);
 	return cur_size;
 }
 
 typedef struct {
+	int64_t pts_us;
+
 	uint8_t *data;
 	uint64_t size;
-	int64_t pts_us;
 } Sample;
 
 typedef struct {
+	int64_t  pts_us;
+
 	uint8_t *pixels;
 	uint8_t *buffers[4];
 	int      strides[4];
-	int64_t  pts_us;
 } Frame;
 
 typedef struct {
@@ -126,6 +136,7 @@ typedef struct {
 
 	int width;
 	int height;
+	enum AVPixelFormat pix_fmt;
 
 	uint32_t sample_rate;
 	uint32_t channels;
@@ -162,10 +173,12 @@ void audio_callback(void *userdata, uint8_t *stream, int len) {
 	int64_t cur_time_us = av_gettime();
 	int64_t rescaled_time_us = cur_time_us - pb->start_time;
 
+	// skip audio frames until we're at the closest one to presentation time
 	int64_t skip_count = 0;
 	Sample *cur_sample = NULL;
-	while (queue_size(&pb->samples) > 0) {
-		Sample *next_sample = (Sample *)queue_peek(&pb->samples);
+	pthread_mutex_lock(&pb->samples.lock);
+	while (queue_size_unsafe(&pb->samples) > 0) {
+		Sample *next_sample = (Sample *)queue_peek_unsafe(&pb->samples);
 		if (next_sample->pts_us > rescaled_time_us) {
 			break;
 		} else {
@@ -173,9 +186,10 @@ void audio_callback(void *userdata, uint8_t *stream, int len) {
 				skip_count += 1;
 				free_sample(cur_sample);
 			}
-			cur_sample = (Sample *)queue_pop(&pb->samples);
+			cur_sample = (Sample *)queue_pop_unsafe(&pb->samples);
 		}
 	}
+	pthread_mutex_unlock(&pb->samples.lock);
 	
 	if (skip_count > 0) {
 		printf("skipping %lld samples\n", skip_count);
@@ -209,33 +223,14 @@ void *decode_video(void *userdata) {
 		return NULL;
 	}
 
-	int video_stream_idx = -1;
-	int audio_stream_idx = -1;
-	for (int i = 0; i < fmt_ctx->nb_streams; i++) {
-		if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && video_stream_idx < 0) {
-			video_stream_idx = i;
-		}
-		if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && audio_stream_idx < 0) {
-			audio_stream_idx = i;
-		}
-	}
-	if (video_stream_idx == -1) {
-		printf("unable to find video stream!\n");
+	const AVCodec *audio_codec = NULL;
+	int audio_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, &audio_codec, 0);
+	if (audio_stream_idx < 0) {
+		printf("Cannot find an audio stream\n");
 		return NULL;
 	}
-	if (audio_stream_idx == -1) {
-		printf("unable to find audio stream!\n");
-		return NULL;
-	}
-
-	AVStream *video_stream = fmt_ctx->streams[video_stream_idx];
 	AVStream *audio_stream = fmt_ctx->streams[audio_stream_idx];
 
-	const AVCodec *audio_codec = avcodec_find_decoder(audio_stream->codecpar->codec_id);
-	if (!audio_codec) {
-		printf("audio codec not found?\n");
-		return NULL;
-	}
 	AVCodecContext *audio_ctx = avcodec_alloc_context3(audio_codec);
 	avcodec_parameters_to_context(audio_ctx, audio_stream->codecpar);
 
@@ -262,11 +257,15 @@ void *decode_video(void *userdata) {
 		return NULL;
 	}
 
-	const AVCodec *video_codec = avcodec_find_decoder(video_stream->codecpar->codec_id);
-	if (!video_codec) {
-		printf("video codec not found?\n");
+	const AVCodec *video_codec = NULL;
+	int video_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &video_codec, 0);
+	if (video_stream_idx < 0) {
+		printf("Cannot find an video stream\n");
 		return NULL;
 	}
+
+	AVStream *video_stream = fmt_ctx->streams[video_stream_idx];
+
 	AVCodecContext *video_ctx = avcodec_alloc_context3(video_codec);
 	avcodec_parameters_to_context(video_ctx, video_stream->codecpar);
 
@@ -276,7 +275,7 @@ void *decode_video(void *userdata) {
 	}
 	pb->frame_rate = av_q2d(video_stream->r_frame_rate);
 
-	struct SwsContext *sws_ctx = sws_getContext(video_ctx->width, video_ctx->height, video_ctx->pix_fmt, pb->width, pb->height, AV_PIX_FMT_YUV420P, SWS_BICUBIC, NULL, NULL, NULL);
+	struct SwsContext *sws_ctx = sws_getContext(video_ctx->width, video_ctx->height, video_ctx->pix_fmt, pb->width, pb->height, pb->pix_fmt, SWS_LANCZOS, NULL, NULL, NULL);
 
 	AVPacket *pkt = av_packet_alloc();
 	AVFrame *frame = av_frame_alloc();
@@ -302,12 +301,12 @@ void *decode_video(void *userdata) {
 					pts = av_rescale_q(frame->best_effort_timestamp, video_stream->time_base, AV_TIME_BASE_Q);
 				}
 
-				int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_YUV420P, pb->width, pb->height, 32);
+				int num_bytes = av_image_get_buffer_size(pb->pix_fmt, pb->width, pb->height, 32);
 				Frame *f = (Frame *)calloc(1, sizeof(Frame));
 				f->pts_us = pts;
 				f->pixels = malloc(num_bytes);
 
-				av_image_fill_arrays(f->buffers, f->strides, f->pixels, AV_PIX_FMT_YUV420P, pb->width, pb->height, 32);
+				av_image_fill_arrays(f->buffers, f->strides, f->pixels, pb->pix_fmt, pb->width, pb->height, 32);
 				sws_scale(sws_ctx, (uint8_t const * const *)frame->data, frame->linesize, 0, video_ctx->height, f->buffers, f->strides);
 
 				while (!queue_push(&pb->frames, (void *)f) && !quit) {
@@ -403,8 +402,10 @@ int main(int argc, char **argv) {
 
 	PlaybackState pb = {
 		.filename = filename,
+
 		.width = width,
 		.height = height,
+		.pix_fmt = AV_PIX_FMT_YUV420P,
 
 		.frames = queue_init(),
 		.samples = queue_init(),
@@ -450,10 +451,13 @@ int main(int argc, char **argv) {
 			} break;
 		}
 
+		// skip video frames until we're at the closest one to presentation time
 		int64_t skip_count = 0;
 		Frame *cur_frame = NULL;
-		while (queue_size(&pb.frames) > 0) {
-			Frame *next_frame = (Frame *)queue_peek(&pb.frames);
+
+		pthread_mutex_lock(&pb.frames.lock);
+		while (queue_size_unsafe(&pb.frames) > 0) {
+			Frame *next_frame = (Frame *)queue_peek_unsafe(&pb.frames);
 			if (next_frame->pts_us > rescaled_time_us) {
 				break;
 			} else {
@@ -461,9 +465,10 @@ int main(int argc, char **argv) {
 					skip_count += 1;
 					free_frame(cur_frame);
 				}
-				cur_frame = (Frame *)queue_pop(&pb.frames);
+				cur_frame = (Frame *)queue_pop_unsafe(&pb.frames);
 			}
 		}
+		pthread_mutex_unlock(&pb.frames.lock);
 		
 		if (skip_count > 0) {
 			printf("skipping %lld frames\n", skip_count);
@@ -492,11 +497,6 @@ int main(int argc, char **argv) {
 
 		if (pb.pause) {
 			continue;
-		}
-
-		if (frame == 493) {
-			pb.pause = true;
-			printf("%08lld | frame %lld, sample %f s\n", rescaled_time_us, frame, audio_clock_s);
 		}
 
 		SDL_RenderClear(renderer);
