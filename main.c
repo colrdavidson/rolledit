@@ -97,6 +97,7 @@ void *queue_peek(Queue *q) {
 typedef struct {
 	uint8_t *data;
 	uint64_t size;
+	int64_t pts_us;
 } Sample;
 
 typedef struct {
@@ -108,7 +109,7 @@ typedef struct {
 
 typedef struct {
 	char *filename;
-	int64_t video_clock;
+	int64_t audio_idx;
 
 	int width;
 	int height;
@@ -125,6 +126,30 @@ void sleep_ns(uint64_t ns) {
 	struct timespec requested_time = (struct timespec){.tv_nsec = ns};
 	struct timespec remaining_time = {};
 	nanosleep(&requested_time, &remaining_time);
+}
+
+void audio_callback(void *userdata, uint8_t *stream, int len) {
+	PlaybackState *pb = (PlaybackState *)userdata;
+
+	Sample *sample = (Sample *)queue_pop(&pb->samples);
+	if (sample != NULL) {
+		uint64_t rem_len = MIN(len, sample->size);
+		if (len != rem_len) {
+			printf("flushing audio buffer tail\n");
+			memset(stream + rem_len, 0, len - rem_len);
+		}
+		memcpy(stream, sample->data, rem_len);
+
+		pb->audio_idx += rem_len;
+
+		free(sample->data);
+		free(sample);
+	} else {
+		printf("nothing to grab\n");
+		memset(stream, 0, len);
+	}
+
+	return;
 }
 
 void *decode_video(void *userdata) {
@@ -242,7 +267,7 @@ void *decode_video(void *userdata) {
 				sws_scale(sws_ctx, (uint8_t const * const *)frame->data, frame->linesize, 0, video_ctx->height, f->buffers, f->strides);
 
 				while (!queue_push(&state->frames, (void *)f)) {
-					sleep_ns(1);
+					sleep_ns(10000);
 				}
 			} while (ret >= 0);
 		} else if (pkt->stream_index == audio_stream_idx) {
@@ -259,6 +284,15 @@ void *decode_video(void *userdata) {
 				} else if (ret < 0) {
 					printf("audio decode error!\n");
 					return NULL;
+				}
+
+				int64_t pts = 0;
+				if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+					pts = av_rescale_q(frame->best_effort_timestamp, audio_stream->time_base, AV_TIME_BASE_Q);
+				}
+				if (state->sample_rate != audio_ctx->sample_rate) {
+					printf("TODO: pts calc needs to get fixed for new sample rate\n");
+					exit(1);
 				}
 
 				int dst_samples = av_rescale_rnd(
@@ -280,10 +314,14 @@ void *decode_video(void *userdata) {
 				int total_size_bytes = dst_chan_sample_count * state->channels * sample_bytes;
 
 				Sample *s = (Sample *)malloc(sizeof(Sample));
-				*s = (Sample){.data = audio_buf, .size = total_size_bytes};
+				*s = (Sample){
+					.data = audio_buf,
+					.size = total_size_bytes,
+					.pts_us = pts
+				};
 
 				while (!queue_push(&state->samples, (void *)s)) {
-					sleep_ns(1);
+					sleep_ns(10000);
 				}
 			} while (ret >= 0);
 		} else {
@@ -312,10 +350,21 @@ int main(int argc, char **argv) {
 	SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC | SDL_RENDERER_TARGETTEXTURE);
 	SDL_Texture *texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_YV12, SDL_TEXTUREACCESS_STREAMING, width, height);
 
+	PlaybackState pb = {
+		.filename = filename,
+		.width = width,
+		.height = height,
+
+		.frames = queue_init(),
+		.samples = queue_init(),
+	};
 	SDL_AudioSpec wanted_specs = (SDL_AudioSpec){
 		.freq = 48000,
 		.format = AUDIO_S16SYS,
 		.channels = 2,
+		.samples = 1024,
+		.callback = audio_callback,
+		.userdata = &pb,
 	};
 	SDL_AudioSpec specs;
 	SDL_AudioDeviceID audio_dev = SDL_OpenAudioDevice(NULL, 0, &wanted_specs, &specs, SDL_AUDIO_ALLOW_FORMAT_CHANGE);
@@ -323,19 +372,12 @@ int main(int argc, char **argv) {
 		printf("Failed to open audio device: %s\n", SDL_GetError());
 		return 1;
 	}
+	
+	pb.sample_rate = specs.freq;
+	pb.channels = specs.channels;
+	pb.sample_fmt = AV_SAMPLE_FMT_S16;
+
 	SDL_PauseAudioDevice(audio_dev, 0);
-	PlaybackState pb = {
-		.filename = filename,
-		.width = width,
-		.height = height,
-
-		.sample_rate = specs.freq,
-		.channels = specs.channels,
-		.sample_fmt = AV_SAMPLE_FMT_S16,
-
-		.frames = queue_init(),
-		.samples = queue_init(),
-	};
 
 	pthread_t decode_thread;
 	pthread_create(&decode_thread, NULL, decode_video, (void *)&pb);
@@ -354,12 +396,6 @@ int main(int argc, char **argv) {
 			} break;
 		}
 
-		Sample *sample = (Sample *)queue_pop(&pb.samples);
-		if (sample != NULL) {
-			SDL_QueueAudio(audio_dev, sample->data, sample->size);
-			free(sample->data);
-			free(sample);
-		}
 
 		Frame *frame = (Frame *)queue_peek(&pb.frames);
 		if (frame != NULL) {
