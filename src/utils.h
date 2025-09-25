@@ -25,6 +25,8 @@ typedef struct {
 	float y;
 } FVec2;
 
+BVec4 color_white = {.r = 255, .g = 255, .b = 255, .a = 255};
+
 void sleep_ns(uint64_t ns) {
 	struct timespec requested_time = (struct timespec){.tv_nsec = ns};
 	struct timespec remaining_time = {};

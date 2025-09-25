@@ -451,6 +451,8 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 
 		.frames = queue_init(),
 		.samples = queue_init(),
+
+		.pause = true,
 	};
 
 	SDL_AudioSpec specs = (SDL_AudioSpec){
@@ -622,7 +624,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 	SDL_FRect out_rect = (SDL_FRect){.x = 0, .y = 0, .w = pb->width, .h = pb->height};
 	SDL_RenderTexture(state->renderer, pb->vid_tex, NULL, &out_rect);
 
-	float bar_h = 2 * em;
+	float bar_h = 4 * em;
 	float bar_y = pb->height - bar_h;
 	float scrub_height = em + (em / 2);
 	// bar background
@@ -630,20 +632,52 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 		(Rect){.x = 0, .y = bar_y, .w = pb->width, .h = bar_h},
 		(BVec4){.r = 20, .g = 20, .b = 20, .a = 150}
 	);
+
+	float overlay_y = bar_y + bar_h / 2;
+	float overlay_h = bar_h / 2;
 	// scrub overlay
 	draw_rect(state,
-		(Rect){.x = scrub_start_x, .y = bar_y, .w = scrub_width, .h = bar_h},
+		(Rect){.x = scrub_start_x, .y = bar_y + overlay_h, .w = scrub_width, .h = overlay_h},
 		(BVec4){.r = 40, .g = 40, .b = 40, .a = 150}
 	);
 
 	// scrub cursor
 	Rect cursor_rect = (Rect){
 		.x = scrub_start_x + scrub_pos + (em / 4),
-		.y = bar_y + (bar_h / 2) - (scrub_height / 2),
+		.y = overlay_y + (overlay_h / 2) - (scrub_height / 2),
 		.w = em,
 		.h = scrub_height
 	};
 	draw_rect(state, cursor_rect, (BVec4){.r = 200, .g = 200, .b = 200, .a = 150});
+
+	// play button
+	char *play_str = "\uf04b";
+	char *pause_str = "\uf04c";
+
+	char *start_stop_str = pause_str;
+	if (pb->pause) {
+		start_stop_str = play_str;
+	}
+
+	int64_t start_stop_str_w = measure_text(state->icon_font, start_stop_str);
+
+	float play_w = 2 * em;
+	float play_pad = em / 4;
+	Rect play_rect = (Rect){
+		.x = (pb->width / 2) - (play_w / 2) + play_pad,
+		.y = bar_y + play_pad,
+		.w = play_w - (2 * play_pad),
+		.h = play_w - (2 * play_pad)
+	};
+
+	draw_text(state, state->icon_font, start_stop_str,
+		(FVec2){.x = (pb->width / 2) - (start_stop_str_w / 2), .y = bar_y + (em / 2)},
+		color_white
+	);
+
+	if (state->cur.clicked && pt_in_rect(state->cur.clicked_pos, play_rect)) {
+		pb->pause = !pb->pause;
+	}
 
 	int64_t time_s = rescaled_time_us / 1000000;
 	int64_t disp_mins = time_s / 60;
@@ -652,7 +686,10 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 	asprintf(&time_str, "%02lld:%02lld", disp_mins, disp_secs);
 
 	int64_t time_str_w = measure_text(state->mono_font, time_str);
-	draw_text(state, state->mono_font, time_str, (FVec2){.x = scrub_start_x + scrub_width + (em / 2), .y = bar_y + (bar_h / 2) - (em / 2)}, (BVec4){.r = 255, .g = 255, .b = 255, .a = 255});
+	draw_text(state, state->mono_font, time_str,
+		(FVec2){.x = scrub_start_x + scrub_width + (em / 2), .y = overlay_y + (overlay_h / 2) - (em / 2)},
+		color_white
+	);
 
 	if (state->cur.clicked && pt_in_rect(state->cur.clicked_pos, cursor_rect)) {
 		state->seeking = true;
