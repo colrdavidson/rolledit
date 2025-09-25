@@ -6,6 +6,10 @@
 #include <pthread.h>
 
 #include <SDL2/SDL.h>
+
+#define GL_SILENCE_DEPRECATION
+#include <OpenGL/gl3.h>
+
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/pixdesc.h>
@@ -15,101 +19,22 @@
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 
-#define SDL_AUDIO_BUFFER_SIZE 1024
-#define MAX_AUDIO_FRAME_SIZE 192000
+#include "utils.h"
+#include "gl_utils.h"
+#include "queue.h"
 
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define SDL_AUDIO_BUFFER_SIZE 1024
 
 bool quit = false;
 
-typedef struct {
-	void **list;
-	int64_t size;
-
-	uint32_t head;
-	uint32_t tail;
-
-	pthread_mutex_t lock;
-} Queue;
-
-Queue queue_init(void) {
-	int64_t initial_size = 64;
-	Queue q = (Queue){
-		.list = calloc(sizeof(void *), initial_size),
-		.size = initial_size,
-		.head = 0,
-		.tail = 0
-	};
-
-	pthread_mutex_init(&q.lock, NULL);
-	return q;
-}
-
-int64_t queue_size_unsafe(Queue *q) {
-	return (int64_t)q->tail - (int64_t)q->head;
-}
-
-bool queue_push(Queue *q, void *data) {
-	pthread_mutex_lock(&q->lock);
-
-	int64_t cur_size = queue_size_unsafe(q);
-	if (cur_size >= q->size) {
-		pthread_mutex_unlock(&q->lock);
-		return false;
-	}
-
-	uint32_t wrapped_tail = q->tail % q->size; 
-	q->list[wrapped_tail] = data;
-	q->tail += 1;
-
-	pthread_mutex_unlock(&q->lock);
-	return true;
-}
-
-void *queue_pop_unsafe(Queue *q) {
-	int64_t cur_size = queue_size_unsafe(q);
-	if (cur_size <= 0) {
-		return NULL;
-	}
-
-	uint32_t wrapped_head = q->head % q->size; 
-	void *data = q->list[wrapped_head];
-	q->head += 1;
-	return data;
-}
-
-void *queue_peek_unsafe(Queue *q) {
-	int64_t cur_size = queue_size_unsafe(q);
-	if (cur_size <= 0) {
-		return NULL;
-	}
-
-	uint32_t wrapped_head = q->head % q->size; 
-	void *data = q->list[wrapped_head];
-	return data;
-}
-
-void *queue_pop(Queue *q) {
-	pthread_mutex_lock(&q->lock);
-	void *data = queue_pop_unsafe(q);
-	pthread_mutex_unlock(&q->lock);
-	return data;
-}
-
-void *queue_peek(Queue *q) {
-	pthread_mutex_lock(&q->lock);
-	void *data = queue_peek_unsafe(q);
-	pthread_mutex_unlock(&q->lock);
-	return data;
-}
-
-int64_t queue_size(Queue *q) {
-	pthread_mutex_lock(&q->lock);
-	int64_t cur_size = queue_size_unsafe(q);
-	pthread_mutex_unlock(&q->lock);
-	return cur_size;
-}
+const char vert_shdr_src[] = {
+	#embed "vert.vsh"
+	,0
+};
+const char frag_shdr_src[] = {
+	#embed "frag.fsh"
+	,0
+};
 
 typedef struct {
 	int64_t pts_us;
@@ -146,11 +71,6 @@ typedef struct {
 	Queue samples;
 } PlaybackState;
 
-void sleep_ns(uint64_t ns) {
-	struct timespec requested_time = (struct timespec){.tv_nsec = ns};
-	struct timespec remaining_time = {};
-	nanosleep(&requested_time, &remaining_time);
-}
 
 void free_frame(Frame *frame) {
 	free(frame->pixels);
@@ -301,12 +221,12 @@ void *decode_video(void *userdata) {
 					pts = av_rescale_q(frame->best_effort_timestamp, video_stream->time_base, AV_TIME_BASE_Q);
 				}
 
-				int num_bytes = av_image_get_buffer_size(pb->pix_fmt, pb->width, pb->height, 32);
+				int num_bytes = av_image_get_buffer_size(pb->pix_fmt, pb->width, pb->height, 1);
 				Frame *f = (Frame *)calloc(1, sizeof(Frame));
 				f->pts_us = pts;
 				f->pixels = malloc(num_bytes);
 
-				av_image_fill_arrays(f->buffers, f->strides, f->pixels, pb->pix_fmt, pb->width, pb->height, 32);
+				av_image_fill_arrays(f->buffers, f->strides, f->pixels, pb->pix_fmt, pb->width, pb->height, 1);
 				sws_scale(sws_ctx, (uint8_t const * const *)frame->data, frame->linesize, 0, video_ctx->height, f->buffers, f->strides);
 
 				while (!queue_push(&pb->frames, (void *)f) && !quit) {
@@ -396,16 +316,75 @@ int main(int argc, char **argv) {
 		width / 2, height / 2, SDL_WINDOW_OPENGL | SDL_WINDOW_ALLOW_HIGHDPI
 	);
 	SDL_GL_SetSwapInterval(1);
+	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+	SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
 
-	SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC | SDL_RENDERER_TARGETTEXTURE);
-	SDL_Texture *texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_YV12, SDL_TEXTUREACCESS_STREAMING, width, height);
+	SDL_GLContext gl_ctx = SDL_GL_CreateContext(window);
+
+	GLuint vid_shdr = glCreateProgram();
+
+	GLint vert_shdr = build_shader(vert_shdr_src, GL_VERTEX_SHADER);
+	if (vert_shdr < 0) { return 1; }
+	glAttachShader(vid_shdr, vert_shdr);
+
+	GLint frag_shdr = build_shader(frag_shdr_src, GL_FRAGMENT_SHADER);
+	if (frag_shdr < 0) { return 1; }
+	glAttachShader(vid_shdr, frag_shdr);
+
+	glLinkProgram(vid_shdr);
+
+	GLint u_dpr = glGetUniformLocation(vid_shdr, "u_dpr");
+	GLint u_res = glGetUniformLocation(vid_shdr, "u_resolution");
+	GLint u_tex = glGetUniformLocation(vid_shdr, "rect_tex");
+
+	GLuint vao;
+	glGenVertexArrays(1, &vao);
+	glBindVertexArray(vao);
+
+	GLuint rect_deets_buffer;
+	glGenBuffers(1, &rect_deets_buffer);
+	glBindBuffer(GL_ARRAY_BUFFER, rect_deets_buffer);
+
+	glEnableVertexAttribArray(V_rect_pos);
+	glVertexAttribPointer(V_rect_pos, 4, GL_FLOAT, false, sizeof(DrawRect), (void *)offsetof(DrawRect, pos));
+	glVertexAttribDivisor(V_rect_pos, 1);
+
+	glEnableVertexAttribArray(V_color);
+	glVertexAttribPointer(V_color, 4, GL_UNSIGNED_BYTE, true, sizeof(DrawRect), (void *)offsetof(DrawRect, color));
+	glVertexAttribDivisor(V_color, 1);
+
+	glEnableVertexAttribArray(V_uv);
+	glVertexAttribPointer(V_uv, 2, GL_FLOAT, false, sizeof(DrawRect), (void *)offsetof(DrawRect, uv));
+	glVertexAttribDivisor(V_uv, 1);
+
+	GLuint rect_points_buffer;
+	glGenBuffers(1, &rect_points_buffer);
+	glBindBuffer(GL_ARRAY_BUFFER, rect_points_buffer);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(idx_pos), idx_pos, GL_STATIC_DRAW);
+
+	glEnableVertexAttribArray(V_idx_pos);
+	glVertexAttribPointer(V_idx_pos, 2, GL_FLOAT, false, 0, 0);
+
+	GLuint vid_tex;
+	glGenTextures(1, &vid_tex);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, vid_tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+	BVec4 blank = {.r = 255, .g = 255, .b = 255, .a = 255 };
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &blank);
+	glUniform1i(u_tex, vid_tex);
 
 	PlaybackState pb = {
 		.filename = filename,
 
 		.width = width,
 		.height = height,
-		.pix_fmt = AV_PIX_FMT_YUV420P,
+		.pix_fmt = AV_PIX_FMT_RGBA,
 
 		.frames = queue_init(),
 		.samples = queue_init(),
@@ -435,6 +414,14 @@ int main(int argc, char **argv) {
 	pthread_create(&decode_thread, NULL, decode_video, (void *)&pb);
 	pb.start_time = av_gettime();
 
+	int32_t real_width, real_height;
+	int32_t pretend_width, pretend_height;
+	SDL_GetWindowSize(window, &pretend_width, &pretend_height);
+	SDL_GL_GetDrawableSize(window, &real_width, &real_height);
+	double dpr = (double)real_width / (double)pretend_width;
+	pb.width = pretend_width * dpr;
+	pb.height = pretend_height * dpr;
+
 	int64_t cur_time_us = av_gettime();
 	for (;;) {
 		if (!pb.pause) {
@@ -450,6 +437,18 @@ int main(int argc, char **argv) {
 				goto end;
 			} break;
 		}
+
+
+		glClearColor(255, 0, 255, 255);
+		glClear(GL_COLOR_BUFFER_BIT);
+
+		glViewport(0, 0, pb.width, pb.height);
+		glUniform1f(u_dpr, dpr);
+		glUniform2f(u_res, pb.width, pb.height);
+		glBindBuffer(GL_ARRAY_BUFFER, rect_deets_buffer);
+		glBindVertexArray(vao);
+
+		glUseProgram(vid_shdr);
 
 		// skip video frames until we're at the closest one to presentation time
 		int64_t skip_count = 0;
@@ -475,15 +474,20 @@ int main(int argc, char **argv) {
 		}
 
 		if (cur_frame && !pb.pause) {
-			SDL_Rect rect = (SDL_Rect){.x = 0, .y = 0, .w = pb.width, .h = pb.height};
-			SDL_UpdateYUVTexture(texture, &rect,
-				cur_frame->buffers[0], cur_frame->strides[0],
-				cur_frame->buffers[1], cur_frame->strides[1],
-				cur_frame->buffers[2], cur_frame->strides[2]
-			);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, pb.width, pb.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, cur_frame->buffers[0]);
 
 			free_frame(cur_frame);
 		}
+
+/*
+		DrawRect vid_rect = (DrawRect){
+			.pos = {.x = 0, .y = 0, .z = pb.width, .w = pb.height},
+			.color = {.r = 255, .a = 255},
+			.uv = {-2, 0},
+		};
+		glBufferData(GL_ARRAY_BUFFER, sizeof(DrawRect), &vid_rect, GL_DYNAMIC_DRAW);
+		glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, 1);
+*/
 
 		int64_t frame = 0;
 		if (pb.frame_rate != 0) {
@@ -499,9 +503,18 @@ int main(int argc, char **argv) {
 			continue;
 		}
 
+/*
 		SDL_RenderClear(renderer);
 		SDL_RenderCopy(renderer, texture, NULL, NULL);
 		SDL_RenderPresent(renderer);
+*/
+		DrawRect vid_rect = (DrawRect){
+			.pos = {.x = 0, .y = 0, .z = pb.width, .w = pb.height},
+			.uv = {.x = 0, .y = 0},
+		};
+		glBufferData(GL_ARRAY_BUFFER, sizeof(DrawRect), &vid_rect, GL_DYNAMIC_DRAW);
+		glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, 1);
+		SDL_GL_SwapWindow(window);
 	}
 
 end:
