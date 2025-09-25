@@ -24,6 +24,8 @@
 #define SDL_AUDIO_BUFFER_SIZE 1024
 
 bool quit = false;
+double p_height = 16;
+double em = 0;
 
 typedef struct {
 	float x;
@@ -86,6 +88,8 @@ typedef struct {
 	pthread_t decode_thread;
 
 	uint64_t now;
+
+	double dpr;
 } AppState;
 
 void free_frame(Frame *frame) {
@@ -319,7 +323,12 @@ void *decode_video(void *userdata) {
 void draw_rect(AppState *state, Rect r, BVec4 color) {
 	SDL_SetRenderDrawColor(state->renderer, color.r, color.g, color.b, color.a);
 
-	SDL_FRect rect = (SDL_FRect){.x = r.x, .y = r.y, .w = r.w, .h = r.h};
+	SDL_FRect rect = (SDL_FRect){
+		.x = r.x,
+		.y = r.y,
+		.w = r.w,
+		.h = r.h
+	};
 	SDL_RenderFillRect(state->renderer, &rect);
 }
 
@@ -355,6 +364,8 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 	SDL_SetRenderDrawBlendMode(state->renderer, SDL_BLENDMODE_BLEND);
 
 	SDL_GetWindowSizeInPixels(window, &width, &height);
+	state->dpr = SDL_GetWindowDisplayScale(window);
+	em = p_height * state->dpr;
 
 	SDL_Texture *vid_tex = SDL_CreateTexture(state->renderer, SDL_PIXELFORMAT_YV12, SDL_TEXTUREACCESS_STREAMING, width, height);
 	SDL_SetTextureScaleMode(vid_tex, SDL_SCALEMODE_NEAREST);
@@ -465,9 +476,24 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 	SDL_FRect out_rect = (SDL_FRect){.x = 0, .y = 0, .w = pb->width, .h = pb->height};
 	SDL_RenderTexture(state->renderer, pb->vid_tex, NULL, &out_rect);
 
-	draw_rect(state, (Rect){.x = 0, .y = pb->height - 30, .w = pb->width, .h = 30}, (BVec4){.r = 20, .g = 20, .b = 20, .a = 150});
-	draw_rect(state, (Rect){.x = scrub_start_x, .y = pb->height - 30, .w = scrub_width, .h = 30}, (BVec4){.r = 40, .g = 40, .b = 40, .a = 150});
-	draw_rect(state, (Rect){.x = scrub_start_x + scrub_pos + 10, .y = pb->height - 25, .w = 10, .h = 20}, (BVec4){.r = 200, .g = 200, .b = 200, .a = 150});
+	double bar_h = 2 * em;
+	double bar_y = pb->height - bar_h;
+	double scrub_height = em + (em / 2);
+	// bar background
+	draw_rect(state,
+		(Rect){.x = 0, .y = bar_y, .w = pb->width, .h = bar_h},
+		(BVec4){.r = 20, .g = 20, .b = 20, .a = 150}
+	);
+	// scrub overlay
+	draw_rect(state,
+		(Rect){.x = scrub_start_x, .y = bar_y, .w = scrub_width, .h = bar_h},
+		(BVec4){.r = 40, .g = 40, .b = 40, .a = 150}
+	);
+	// scrub cursor
+	draw_rect(state,
+		(Rect){.x = scrub_start_x + scrub_pos + (em / 4), .y = bar_y + (bar_h / 2) - (scrub_height / 2), .w = em, .h = scrub_height},
+		(BVec4){.r = 200, .g = 200, .b = 200, .a = 150}
+	);
 	SDL_RenderPresent(state->renderer);
 
 	return SDL_APP_CONTINUE;
