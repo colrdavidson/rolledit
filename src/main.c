@@ -137,21 +137,25 @@ void audio_callback(void *userdata, SDL_AudioStream *stream, int additional, int
 	// skip audio frames until we're at the closest one to presentation time
 	int64_t skip_count = 0;
 	Sample *cur_sample = NULL;
+
 	pthread_mutex_lock(&pb->samples.lock);
 	while (queue_size_unsafe(&pb->samples) > 0) {
-		Sample *next_sample = (Sample *)queue_peek_unsafe(&pb->samples);
-		if (next_sample->pts_us > rescaled_time_us) {
-			break;
-		} else {
+		Sample *s = queue_peek_unsafe(&pb->samples);
+		if (s->pts_us <= rescaled_time_us) {
 			if (cur_sample) {
 				skip_count += 1;
 				free_sample(cur_sample);
 			}
-			cur_sample = (Sample *)queue_pop_unsafe(&pb->samples);
+			cur_sample = queue_pop_unsafe(&pb->samples);
+		} else {
+			if (!cur_sample) {
+				cur_sample = queue_pop_unsafe(&pb->samples);
+			}
+			break;
 		}
 	}
 	pthread_mutex_unlock(&pb->samples.lock);
-	
+
 	if (skip_count > 0) {
 		printf("skipping %lld samples\n", skip_count);
 	}
@@ -162,8 +166,6 @@ void audio_callback(void *userdata, SDL_AudioStream *stream, int additional, int
 		pb->audio_idx += rem_len;
 
 		free_sample(cur_sample);
-	} else {
-		printf("nothing to grab\n");
 	}
 
 	return;
@@ -453,7 +455,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 
 	SDL_AudioSpec specs = (SDL_AudioSpec){
 		.freq = 48000,
-		.format = SDL_AUDIO_S16,
+		.format = SDL_AUDIO_S16LE,
 		.channels = 2,
 	};
 	SDL_AudioStream *stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &specs, audio_callback, &state->pb);
@@ -571,15 +573,15 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 
 	pthread_mutex_lock(&pb->frames.lock);
 	while (queue_size_unsafe(&pb->frames) > 0) {
-		Frame *next_frame = (Frame *)queue_peek_unsafe(&pb->frames);
-		if (next_frame->pts_us > rescaled_time_us) {
-			break;
-		} else {
+		Frame *f = (Frame *)queue_peek_unsafe(&pb->frames);
+		if (f->pts_us <= rescaled_time_us) {
 			if (cur_frame) {
 				skip_count += 1;
 				free_frame(cur_frame);
 			}
 			cur_frame = (Frame *)queue_pop_unsafe(&pb->frames);
+		} else {
+			break;
 		}
 	}
 	pthread_mutex_unlock(&pb->frames.lock);
