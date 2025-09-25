@@ -8,6 +8,7 @@
 #define SDL_MAIN_USE_CALLBACKS 1
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
+#include <SDL3_ttf/SDL_ttf.h>
 
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -22,6 +23,18 @@
 #include "queue.h"
 
 #define SDL_AUDIO_BUFFER_SIZE 1024
+
+uint8_t sans_ttf[] = {
+	#embed "../fonts/Montserrat-Regular.ttf"
+};
+
+uint8_t mono_ttf[] = {
+	#embed "../fonts/FiraMono-Regular.ttf"
+};
+
+uint8_t icon_ttf[] = {
+	#embed "../fonts/fontawesome-webfont.ttf"
+};
 
 bool quit = false;
 double p_height = 16;
@@ -95,6 +108,10 @@ typedef struct {
 	Cursor cur;
 
 	bool seeking;
+
+	TTF_Font *sans_font;
+	TTF_Font *mono_font;
+	TTF_Font *icon_font;
 } AppState;
 
 void free_frame(Frame *frame) {
@@ -337,6 +354,35 @@ void draw_rect(AppState *state, Rect r, BVec4 color) {
 	SDL_RenderFillRect(state->renderer, &rect);
 }
 
+int64_t measure_text(TTF_Font *font, char *str) {
+	int width = 0;
+	TTF_MeasureString(font, str, 0, 0, &width, NULL);
+	return width;
+}
+
+void draw_text(AppState *state, TTF_Font *font, char *str, FVec2 pos, BVec4 color) {
+	SDL_Surface *tex_surf = TTF_RenderText_Blended(font, str, 0, (SDL_Color){.r = color.r, .g = color.g, .b = color.b, .a = color.a});
+	if (!tex_surf) {
+		printf("Failed to render text? %s\n", SDL_GetError());
+		quit = true;
+		return;
+	}
+	SDL_Texture *text_tex = SDL_CreateTextureFromSurface(state->renderer, tex_surf);
+	SDL_DestroySurface(tex_surf);
+
+	float w = 0;
+	float h = 0;
+	SDL_GetTextureSize(text_tex, &w, &h);
+	SDL_FRect rect = (SDL_FRect){
+		.x = pos.x,
+		.y = pos.y,
+		.w = w,
+		.h = h
+	};
+	SDL_RenderTexture(state->renderer, text_tex, NULL, &rect);
+	SDL_DestroyTexture(text_tex);
+}
+
 SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 	if (argc < 2) {
 		printf("expected file to open\n");
@@ -353,6 +399,12 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 		return SDL_APP_FAILURE;
 	}
 
+	if (!TTF_Init()) {
+		printf("failed to init SDL_TTF\n");
+		return SDL_APP_FAILURE;
+	}
+
+
 	SDL_Window *window;
 	if (!SDL_CreateWindowAndRenderer("Viewer", width / 2, height / 2, SDL_WINDOW_HIGH_PIXEL_DENSITY, &window, &state->renderer)) {
 		printf("failed to create window/renderer\n");
@@ -367,6 +419,24 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 
 	SDL_Texture *vid_tex = SDL_CreateTexture(state->renderer, SDL_PIXELFORMAT_YV12, SDL_TEXTUREACCESS_STREAMING, width, height);
 	SDL_SetTextureScaleMode(vid_tex, SDL_SCALEMODE_NEAREST);
+
+	state->sans_font = TTF_OpenFontIO(SDL_IOFromConstMem(sans_ttf, sizeof(sans_ttf)), true, em);
+	if (!state->sans_font) {
+		printf("Failed to open sans font\n");
+		return SDL_APP_FAILURE;
+	}
+
+	state->mono_font = TTF_OpenFontIO(SDL_IOFromConstMem(mono_ttf, sizeof(mono_ttf)), true, em);
+	if (!state->mono_font) {
+		printf("Failed to open mono font\n");
+		return SDL_APP_FAILURE;
+	}
+
+	state->icon_font = TTF_OpenFontIO(SDL_IOFromConstMem(icon_ttf, sizeof(icon_ttf)), true, em);
+	if (!state->icon_font) {
+		printf("Failed to open icon font\n");
+		return SDL_APP_FAILURE;
+	}
 
 	state->pb = (PlaybackState){
 		.filename = filename,
@@ -466,6 +536,10 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
 }
 
 SDL_AppResult SDL_AppIterate(void *appstate) {
+	if (quit) {
+		return SDL_APP_SUCCESS;
+	}
+
 	AppState *state = (AppState *)appstate;
 	PlaybackState *pb = &state->pb;
 
@@ -568,6 +642,15 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 		.h = scrub_height
 	};
 	draw_rect(state, cursor_rect, (BVec4){.r = 200, .g = 200, .b = 200, .a = 150});
+
+	int64_t time_s = rescaled_time_us / 1000000;
+	int64_t disp_mins = time_s / 60;
+	int64_t disp_secs = time_s % 60;
+	char *time_str = NULL;
+	asprintf(&time_str, "%02lld:%02lld", disp_mins, disp_secs);
+
+	int64_t time_str_w = measure_text(state->mono_font, time_str);
+	draw_text(state, state->mono_font, time_str, (FVec2){.x = scrub_start_x + scrub_width + (em / 2), .y = bar_y + (bar_h / 2) - (em / 2)}, (BVec4){.r = 255, .g = 255, .b = 255, .a = 255});
 
 	if (state->cur.clicked && pt_in_rect(state->cur.clicked_pos, cursor_rect)) {
 		state->seeking = true;
