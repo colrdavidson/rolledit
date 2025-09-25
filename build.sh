@@ -1,1 +1,1 @@
-clang -o rolledit -std=c23 -O0 -g -I/opt/homebrew/include -L/opt/homebrew/lib -L/usr/local/lib -rpath /usr/local/lib -lSDL2 -lavformat -lavcodec -lswscale -lavutil -lswresample -framework OpenGL src/main.c
+clang -o rolledit -O0 -g -I/opt/homebrew/include -L/opt/homebrew/lib -L/usr/local/lib -rpath /usr/local/lib -lSDL3 -lavformat -lavcodec -lswscale -lavutil -lswresample src/main.c

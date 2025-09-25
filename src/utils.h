@@ -9,3 +9,7 @@ void sleep_ns(uint64_t ns) {
 	struct timespec remaining_time = {};
 	nanosleep(&requested_time, &remaining_time);
 }
+
+double lerp(double start, double end, double perc) {
+	return start + perc * (end - start);
+}

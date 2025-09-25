@@ -5,10 +5,9 @@
 #include <fcntl.h>
 #include <pthread.h>
 
-#include <SDL2/SDL.h>
-
-#define GL_SILENCE_DEPRECATION
-#include <OpenGL/gl3.h>
+#define SDL_MAIN_USE_CALLBACKS 1
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
 
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -20,21 +19,25 @@
 #include <libswresample/swresample.h>
 
 #include "utils.h"
-#include "gl_utils.h"
 #include "queue.h"
 
 #define SDL_AUDIO_BUFFER_SIZE 1024
 
 bool quit = false;
 
-const char vert_shdr_src[] = {
-	#embed "vert.vsh"
-	,0
-};
-const char frag_shdr_src[] = {
-	#embed "frag.fsh"
-	,0
-};
+typedef struct {
+	float x;
+	float y;
+	float w;
+	float h;
+} Rect;
+
+typedef struct {
+	uint8_t r;
+	uint8_t g;
+	uint8_t b;
+	uint8_t a;
+} BVec4;
 
 typedef struct {
 	int64_t pts_us;
@@ -54,10 +57,15 @@ typedef struct {
 typedef struct {
 	char *filename;
 
+	int64_t cur_time;
+
 	bool pause;
 	int64_t start_time;
 	double frame_rate;
+	double duration_us;
 	int64_t audio_idx;
+
+	SDL_Texture *vid_tex;
 
 	int width;
 	int height;
@@ -71,6 +79,14 @@ typedef struct {
 	Queue samples;
 } PlaybackState;
 
+typedef struct {
+	SDL_Renderer *renderer;
+
+	PlaybackState pb;
+	pthread_t decode_thread;
+
+	uint64_t now;
+} AppState;
 
 void free_frame(Frame *frame) {
 	free(frame->pixels);
@@ -82,9 +98,8 @@ void free_sample(Sample *sample) {
 	free(sample);
 }
 
-void audio_callback(void *userdata, uint8_t *stream, int len) {
+void audio_callback(void *userdata, SDL_AudioStream *stream, int additional, int total) {
 	PlaybackState *pb = (PlaybackState *)userdata;
-	memset(stream, 0, len);
 
 	if (pb->pause) {
 		return;
@@ -116,9 +131,8 @@ void audio_callback(void *userdata, uint8_t *stream, int len) {
 	}
 
 	if (cur_sample) {
-		uint64_t rem_len = MIN(len, cur_sample->size);
-		memcpy(stream, cur_sample->data, rem_len);
-
+		uint64_t rem_len = MIN(additional, cur_sample->size);
+		SDL_PutAudioStreamData(stream, cur_sample->data, rem_len);
 		pb->audio_idx += rem_len;
 
 		free_sample(cur_sample);
@@ -194,6 +208,7 @@ void *decode_video(void *userdata) {
 		return NULL;
 	}
 	pb->frame_rate = av_q2d(video_stream->r_frame_rate);
+	pb->duration_us = ((double)fmt_ctx->duration / AV_TIME_BASE) * 1000000;
 
 	struct SwsContext *sws_ctx = sws_getContext(video_ctx->width, video_ctx->height, video_ctx->pix_fmt, pb->width, pb->height, pb->pix_fmt, SWS_LANCZOS, NULL, NULL, NULL);
 
@@ -301,7 +316,21 @@ void *decode_video(void *userdata) {
 	return NULL;
 }
 
-int main(int argc, char **argv) {
+void draw_rect(AppState *state, Rect r, BVec4 color) {
+	SDL_SetRenderDrawColor(state->renderer, color.r, color.g, color.b, color.a);
+
+	SDL_FRect rect = (SDL_FRect){.x = r.x, .y = r.y, .w = r.w, .h = r.h};
+	SDL_RenderFillRect(state->renderer, &rect);
+}
+
+SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
+	if (event->type == SDL_EVENT_QUIT) {
+		return SDL_APP_SUCCESS;
+	}
+	return SDL_APP_CONTINUE;
+}
+
+SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 	if (argc < 2) {
 		printf("expected file to open\n");
 		return 1;
@@ -310,215 +339,143 @@ int main(int argc, char **argv) {
 
 	int width = 1920;
 	int height = 1080;
-	SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
-	SDL_Window *window = SDL_CreateWindow(
-		"Viewer", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-		width / 2, height / 2, SDL_WINDOW_OPENGL | SDL_WINDOW_ALLOW_HIGHDPI
-	);
-	SDL_GL_SetSwapInterval(1);
-	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-	SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+	AppState *state = (AppState *)malloc(sizeof(AppState));
 
-	SDL_GLContext gl_ctx = SDL_GL_CreateContext(window);
+	if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
+		printf("failed to init SDL\n");
+		return SDL_APP_FAILURE;
+	}
 
-	GLuint vid_shdr = glCreateProgram();
+	SDL_Window *window;
+	if (!SDL_CreateWindowAndRenderer("Viewer", width / 2, height / 2, SDL_WINDOW_HIGH_PIXEL_DENSITY, &window, &state->renderer)) {
+		printf("failed to create window/renderer\n");
+		return SDL_APP_FAILURE;
+	}
+	SDL_SetRenderVSync(state->renderer, 1);
+	SDL_SetRenderDrawBlendMode(state->renderer, SDL_BLENDMODE_BLEND);
 
-	GLint vert_shdr = build_shader(vert_shdr_src, GL_VERTEX_SHADER);
-	if (vert_shdr < 0) { return 1; }
-	glAttachShader(vid_shdr, vert_shdr);
+	SDL_GetWindowSizeInPixels(window, &width, &height);
 
-	GLint frag_shdr = build_shader(frag_shdr_src, GL_FRAGMENT_SHADER);
-	if (frag_shdr < 0) { return 1; }
-	glAttachShader(vid_shdr, frag_shdr);
+	SDL_Texture *vid_tex = SDL_CreateTexture(state->renderer, SDL_PIXELFORMAT_YV12, SDL_TEXTUREACCESS_STREAMING, width, height);
+	SDL_SetTextureScaleMode(vid_tex, SDL_SCALEMODE_NEAREST);
 
-	glLinkProgram(vid_shdr);
-
-	GLint u_dpr = glGetUniformLocation(vid_shdr, "u_dpr");
-	GLint u_res = glGetUniformLocation(vid_shdr, "u_resolution");
-	GLint u_tex = glGetUniformLocation(vid_shdr, "rect_tex");
-
-	GLuint vao;
-	glGenVertexArrays(1, &vao);
-	glBindVertexArray(vao);
-
-	GLuint rect_deets_buffer;
-	glGenBuffers(1, &rect_deets_buffer);
-	glBindBuffer(GL_ARRAY_BUFFER, rect_deets_buffer);
-
-	glEnableVertexAttribArray(V_rect_pos);
-	glVertexAttribPointer(V_rect_pos, 4, GL_FLOAT, false, sizeof(DrawRect), (void *)offsetof(DrawRect, pos));
-	glVertexAttribDivisor(V_rect_pos, 1);
-
-	glEnableVertexAttribArray(V_color);
-	glVertexAttribPointer(V_color, 4, GL_UNSIGNED_BYTE, true, sizeof(DrawRect), (void *)offsetof(DrawRect, color));
-	glVertexAttribDivisor(V_color, 1);
-
-	glEnableVertexAttribArray(V_uv);
-	glVertexAttribPointer(V_uv, 2, GL_FLOAT, false, sizeof(DrawRect), (void *)offsetof(DrawRect, uv));
-	glVertexAttribDivisor(V_uv, 1);
-
-	GLuint rect_points_buffer;
-	glGenBuffers(1, &rect_points_buffer);
-	glBindBuffer(GL_ARRAY_BUFFER, rect_points_buffer);
-	glBufferData(GL_ARRAY_BUFFER, sizeof(idx_pos), idx_pos, GL_STATIC_DRAW);
-
-	glEnableVertexAttribArray(V_idx_pos);
-	glVertexAttribPointer(V_idx_pos, 2, GL_FLOAT, false, 0, 0);
-
-	GLuint vid_tex;
-	glGenTextures(1, &vid_tex);
-	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, vid_tex);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-	BVec4 blank = {.r = 255, .g = 255, .b = 255, .a = 255 };
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &blank);
-	glUniform1i(u_tex, vid_tex);
-
-	PlaybackState pb = {
+	state->pb = (PlaybackState){
 		.filename = filename,
 
 		.width = width,
 		.height = height,
-		.pix_fmt = AV_PIX_FMT_RGBA,
+		.pix_fmt = AV_PIX_FMT_YUV420P,
+
+		.vid_tex = vid_tex,
 
 		.frames = queue_init(),
 		.samples = queue_init(),
 	};
-	SDL_AudioSpec wanted_specs = (SDL_AudioSpec){
+
+	SDL_AudioSpec specs = (SDL_AudioSpec){
 		.freq = 48000,
-		.format = AUDIO_S16SYS,
+		.format = SDL_AUDIO_S16,
 		.channels = 2,
-		.samples = 1024,
-		.callback = audio_callback,
-		.userdata = &pb,
 	};
-	SDL_AudioSpec specs;
-	SDL_AudioDeviceID audio_dev = SDL_OpenAudioDevice(NULL, 0, &wanted_specs, &specs, SDL_AUDIO_ALLOW_FORMAT_CHANGE);
-	if (audio_dev == 0) {
-		printf("Failed to open audio device: %s\n", SDL_GetError());
-		return 1;
+	SDL_AudioStream *stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &specs, audio_callback, &state->pb);
+	if (!stream) {
+		printf("failed to open audio device!\n");
+		return SDL_APP_FAILURE;
 	}
 	
-	pb.sample_rate = specs.freq;
-	pb.channels = specs.channels;
-	pb.sample_fmt = AV_SAMPLE_FMT_S16;
+	state->pb.sample_rate = specs.freq;
+	state->pb.channels = specs.channels;
+	state->pb.sample_fmt = AV_SAMPLE_FMT_S16;
 
-	SDL_PauseAudioDevice(audio_dev, 0);
+	SDL_ResumeAudioStreamDevice(stream);
 
-	pthread_t decode_thread;
-	pthread_create(&decode_thread, NULL, decode_video, (void *)&pb);
-	pb.start_time = av_gettime();
+	pthread_create(&state->decode_thread, NULL, decode_video, (void *)&state->pb);
+	state->pb.start_time = av_gettime();
+	*appstate = state;
 
-	int32_t real_width, real_height;
-	int32_t pretend_width, pretend_height;
-	SDL_GetWindowSize(window, &pretend_width, &pretend_height);
-	SDL_GL_GetDrawableSize(window, &real_width, &real_height);
-	double dpr = (double)real_width / (double)pretend_width;
-	pb.width = pretend_width * dpr;
-	pb.height = pretend_height * dpr;
+	state->pb.cur_time = av_gettime();
+	return SDL_APP_CONTINUE;
+}
 
-	int64_t cur_time_us = av_gettime();
-	for (;;) {
-		if (!pb.pause) {
-			cur_time_us = av_gettime();
-		}
-		int64_t rescaled_time_us = cur_time_us - pb.start_time;
+SDL_AppResult SDL_AppIterate(void *appstate) {
+	AppState *state = appstate;
+	PlaybackState *pb = &state->pb;
 
-		SDL_Event event;
-		SDL_PollEvent(&event);
-		switch (event.type) {
-			case SDL_QUIT: {
-				quit = true;
-				goto end;
-			} break;
-		}
+	uint64_t last = SDL_GetPerformanceCounter();
+	state->now = SDL_GetPerformanceCounter();
+	double dt = (double)((state->now - last) * 1000.0) / (double)SDL_GetPerformanceFrequency();
 
+	if (!pb->pause) {
+		pb->cur_time = av_gettime();
+	}
+	int64_t rescaled_time_us = pb->cur_time - pb->start_time;
 
-		glClearColor(255, 0, 255, 255);
-		glClear(GL_COLOR_BUFFER_BIT);
+	// skip video frames until we're at the closest one to presentation time
+	int64_t skip_count = 0;
+	Frame *cur_frame = NULL;
 
-		glViewport(0, 0, pb.width, pb.height);
-		glUniform1f(u_dpr, dpr);
-		glUniform2f(u_res, pb.width, pb.height);
-		glBindBuffer(GL_ARRAY_BUFFER, rect_deets_buffer);
-		glBindVertexArray(vao);
-
-		glUseProgram(vid_shdr);
-
-		// skip video frames until we're at the closest one to presentation time
-		int64_t skip_count = 0;
-		Frame *cur_frame = NULL;
-
-		pthread_mutex_lock(&pb.frames.lock);
-		while (queue_size_unsafe(&pb.frames) > 0) {
-			Frame *next_frame = (Frame *)queue_peek_unsafe(&pb.frames);
-			if (next_frame->pts_us > rescaled_time_us) {
-				break;
-			} else {
-				if (cur_frame) {
-					skip_count += 1;
-					free_frame(cur_frame);
-				}
-				cur_frame = (Frame *)queue_pop_unsafe(&pb.frames);
+	pthread_mutex_lock(&pb->frames.lock);
+	while (queue_size_unsafe(&pb->frames) > 0) {
+		Frame *next_frame = (Frame *)queue_peek_unsafe(&pb->frames);
+		if (next_frame->pts_us > rescaled_time_us) {
+			break;
+		} else {
+			if (cur_frame) {
+				skip_count += 1;
+				free_frame(cur_frame);
 			}
+			cur_frame = (Frame *)queue_pop_unsafe(&pb->frames);
 		}
-		pthread_mutex_unlock(&pb.frames.lock);
-		
-		if (skip_count > 0) {
-			printf("skipping %lld frames\n", skip_count);
-		}
+	}
+	pthread_mutex_unlock(&pb->frames.lock);
 
-		if (cur_frame && !pb.pause) {
-			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, pb.width, pb.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, cur_frame->buffers[0]);
-
-			free_frame(cur_frame);
-		}
-
-/*
-		DrawRect vid_rect = (DrawRect){
-			.pos = {.x = 0, .y = 0, .z = pb.width, .w = pb.height},
-			.color = {.r = 255, .a = 255},
-			.uv = {-2, 0},
-		};
-		glBufferData(GL_ARRAY_BUFFER, sizeof(DrawRect), &vid_rect, GL_DYNAMIC_DRAW);
-		glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, 1);
-*/
-
-		int64_t frame = 0;
-		if (pb.frame_rate != 0) {
-			double us_per_frame = 1000000.0 / pb.frame_rate;
-			frame = (int64_t)((double)rescaled_time_us / us_per_frame);
-		}
-
-		int sample_bytes = av_get_bytes_per_sample(pb.sample_fmt);
-		int64_t bytes_per_s = pb.sample_rate * sample_bytes * pb.channels;
-		double audio_clock_s = (double)pb.audio_idx / (double)bytes_per_s;
-
-		if (pb.pause) {
-			continue;
-		}
-
-/*
-		SDL_RenderClear(renderer);
-		SDL_RenderCopy(renderer, texture, NULL, NULL);
-		SDL_RenderPresent(renderer);
-*/
-		DrawRect vid_rect = (DrawRect){
-			.pos = {.x = 0, .y = 0, .z = pb.width, .w = pb.height},
-			.uv = {.x = 0, .y = 0},
-		};
-		glBufferData(GL_ARRAY_BUFFER, sizeof(DrawRect), &vid_rect, GL_DYNAMIC_DRAW);
-		glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, 1);
-		SDL_GL_SwapWindow(window);
+	if (skip_count > 0) {
+		printf("skipping %lld frames\n", skip_count);
 	}
 
-end:
-	pthread_join(decode_thread, NULL);
-	SDL_Quit();
-	return 0;
+	if (cur_frame && !pb->pause) {
+		SDL_UpdateYUVTexture(pb->vid_tex, NULL,
+			cur_frame->buffers[0], cur_frame->strides[0],
+			cur_frame->buffers[1], cur_frame->strides[1],
+			cur_frame->buffers[2], cur_frame->strides[2]
+		);
+		free_frame(cur_frame);
+	}
+
+	double scrub_start_x = pb->width / 4;
+	double scrub_end_x   = pb->width - (scrub_start_x);
+	double scrub_width = scrub_end_x - scrub_start_x;
+
+	int64_t frame = 0;
+	double scrub_pos = 0.0;
+	if (pb->frame_rate != 0 && pb->duration_us != 0) {
+		double us_per_frame = 1000000.0 / pb->frame_rate;
+		frame = (int64_t)((double)rescaled_time_us / us_per_frame);
+
+		double watch_perc = (double)rescaled_time_us / pb->duration_us;
+		scrub_pos = lerp(0.0, scrub_width, watch_perc);
+	}
+
+	int sample_bytes = av_get_bytes_per_sample(pb->sample_fmt);
+	int64_t bytes_per_s = pb->sample_rate * sample_bytes * pb->channels;
+	double audio_clock_s = (double)pb->audio_idx / (double)bytes_per_s;
+
+	SDL_RenderClear(state->renderer);
+
+	SDL_FRect out_rect = (SDL_FRect){.x = 0, .y = 0, .w = pb->width, .h = pb->height};
+	SDL_RenderTexture(state->renderer, pb->vid_tex, NULL, &out_rect);
+
+	draw_rect(state, (Rect){.x = 0, .y = pb->height - 30, .w = pb->width, .h = 30}, (BVec4){.r = 20, .g = 20, .b = 20, .a = 150});
+	draw_rect(state, (Rect){.x = scrub_start_x, .y = pb->height - 30, .w = scrub_width, .h = 30}, (BVec4){.r = 40, .g = 40, .b = 40, .a = 150});
+	draw_rect(state, (Rect){.x = scrub_start_x + scrub_pos + 10, .y = pb->height - 25, .w = 10, .h = 20}, (BVec4){.r = 200, .g = 200, .b = 200, .a = 150});
+	SDL_RenderPresent(state->renderer);
+
+	return SDL_APP_CONTINUE;
+}
+
+void SDL_AppQuit(void *appstate, SDL_AppResult result) {
+	AppState *state = (AppState *)appstate;
+
+	quit = true;
+	pthread_join(state->decode_thread, NULL);
 }
