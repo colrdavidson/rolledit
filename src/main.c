@@ -28,20 +28,6 @@ double p_height = 16;
 double em = 0;
 
 typedef struct {
-	float x;
-	float y;
-	float w;
-	float h;
-} Rect;
-
-typedef struct {
-	uint8_t r;
-	uint8_t g;
-	uint8_t b;
-	uint8_t a;
-} BVec4;
-
-typedef struct {
 	int64_t pts_us;
 
 	uint8_t *data;
@@ -57,6 +43,8 @@ typedef struct {
 } Frame;
 
 typedef struct {
+	pthread_t decode_thread;
+
 	char *filename;
 
 	int64_t cur_time;
@@ -82,14 +70,31 @@ typedef struct {
 } PlaybackState;
 
 typedef struct {
+	bool clicked;
+	bool is_down;
+	bool was_down;
+	bool up_now;
+
+	FVec2 pos;
+	FVec2 last_pos;
+	FVec2 clicked_pos;
+
+	int64_t clicked_ms;
+} Cursor;
+
+typedef struct {
 	SDL_Renderer *renderer;
+	uint64_t frame_count;
+	uint64_t last_frame_count;
 
 	PlaybackState pb;
-	pthread_t decode_thread;
 
 	uint64_t now;
-
 	double dpr;
+
+	Cursor cur;
+
+	bool seeking;
 } AppState;
 
 void free_frame(Frame *frame) {
@@ -332,13 +337,6 @@ void draw_rect(AppState *state, Rect r, BVec4 color) {
 	SDL_RenderFillRect(state->renderer, &rect);
 }
 
-SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
-	if (event->type == SDL_EVENT_QUIT) {
-		return SDL_APP_SUCCESS;
-	}
-	return SDL_APP_CONTINUE;
-}
-
 SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 	if (argc < 2) {
 		printf("expected file to open\n");
@@ -400,7 +398,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 
 	SDL_ResumeAudioStreamDevice(stream);
 
-	pthread_create(&state->decode_thread, NULL, decode_video, (void *)&state->pb);
+	pthread_create(&state->pb.decode_thread, NULL, decode_video, (void *)&state->pb);
 	state->pb.start_time = av_gettime();
 	*appstate = state;
 
@@ -408,13 +406,85 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 	return SDL_APP_CONTINUE;
 }
 
+void reset_cursor(Cursor *c) {
+	c->clicked = false;
+	c->was_down = false;
+	c->up_now = false;
+}
+
+SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
+	AppState *state = (AppState *)appstate;
+	switch (event->type) {
+		case SDL_EVENT_QUIT: {
+			return SDL_APP_SUCCESS;
+		} break;
+		case SDL_EVENT_MOUSE_BUTTON_DOWN: {
+			float x = event->button.x;
+			float y = event->button.y;
+			SDL_RenderCoordinatesFromWindow(state->renderer, x, y, &x, &y);
+
+			if (state->frame_count != state->last_frame_count) {
+				state->cur.last_pos = state->cur.pos;
+				state->last_frame_count = state->frame_count;
+			}
+
+			state->cur.is_down = true;
+			state->cur.pos = (FVec2){.x = x, .y = y};
+			state->cur.clicked = true;
+			state->cur.clicked_pos = state->cur.pos;
+		} break;
+		case SDL_EVENT_MOUSE_BUTTON_UP: {
+			float x = event->button.x;
+			float y = event->button.y;
+			SDL_RenderCoordinatesFromWindow(state->renderer, x, y, &x, &y);
+
+			if (state->frame_count != state->last_frame_count) {
+				state->cur.last_pos = state->cur.pos;
+				state->last_frame_count = state->frame_count;
+			}
+
+			state->cur.is_down = false;
+			state->cur.pos = (FVec2){.x = x, .y = y};
+			state->cur.was_down = true;
+			state->cur.up_now = true;
+		} break;
+		case SDL_EVENT_MOUSE_MOTION: {
+			float x = event->motion.x;
+			float y = event->motion.y;
+			SDL_RenderCoordinatesFromWindow(state->renderer, x, y, &x, &y);
+
+			if (state->frame_count != state->last_frame_count) {
+				state->cur.last_pos = state->cur.pos;
+				state->last_frame_count = state->frame_count;
+
+			}
+			state->cur.pos = (FVec2){.x = x, .y = y};
+		} break;
+	}
+
+	return SDL_APP_CONTINUE;
+}
+
 SDL_AppResult SDL_AppIterate(void *appstate) {
-	AppState *state = appstate;
+	AppState *state = (AppState *)appstate;
 	PlaybackState *pb = &state->pb;
 
 	uint64_t last = SDL_GetPerformanceCounter();
 	state->now = SDL_GetPerformanceCounter();
 	double dt = (double)((state->now - last) * 1000.0) / (double)SDL_GetPerformanceFrequency();
+
+	bool panned = false;
+	if (state->cur.is_down || state->cur.up_now) {
+		double pan_dist = distance(state->cur.pos, state->cur.clicked_pos);
+		if (pan_dist > 5.0) {
+			panned = true;
+		}
+	}
+
+	FVec2 pan_delta = {};
+	if (panned) {
+		pan_delta = vec2_sub(state->cur.pos, state->cur.last_pos);
+	}
 
 	if (!pb->pause) {
 		pb->cur_time = av_gettime();
@@ -453,9 +523,9 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 		free_frame(cur_frame);
 	}
 
-	double scrub_start_x = pb->width / 4;
-	double scrub_end_x   = pb->width - (scrub_start_x);
-	double scrub_width = scrub_end_x - scrub_start_x;
+	float scrub_start_x = pb->width / 4;
+	float scrub_end_x   = pb->width - (scrub_start_x);
+	float scrub_width = scrub_end_x - scrub_start_x;
 
 	int64_t frame = 0;
 	double scrub_pos = 0.0;
@@ -476,9 +546,9 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 	SDL_FRect out_rect = (SDL_FRect){.x = 0, .y = 0, .w = pb->width, .h = pb->height};
 	SDL_RenderTexture(state->renderer, pb->vid_tex, NULL, &out_rect);
 
-	double bar_h = 2 * em;
-	double bar_y = pb->height - bar_h;
-	double scrub_height = em + (em / 2);
+	float bar_h = 2 * em;
+	float bar_y = pb->height - bar_h;
+	float scrub_height = em + (em / 2);
 	// bar background
 	draw_rect(state,
 		(Rect){.x = 0, .y = bar_y, .w = pb->width, .h = bar_h},
@@ -489,13 +559,33 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 		(Rect){.x = scrub_start_x, .y = bar_y, .w = scrub_width, .h = bar_h},
 		(BVec4){.r = 40, .g = 40, .b = 40, .a = 150}
 	);
+
 	// scrub cursor
-	draw_rect(state,
-		(Rect){.x = scrub_start_x + scrub_pos + (em / 4), .y = bar_y + (bar_h / 2) - (scrub_height / 2), .w = em, .h = scrub_height},
-		(BVec4){.r = 200, .g = 200, .b = 200, .a = 150}
-	);
+	Rect cursor_rect = (Rect){
+		.x = scrub_start_x + scrub_pos + (em / 4),
+		.y = bar_y + (bar_h / 2) - (scrub_height / 2),
+		.w = em,
+		.h = scrub_height
+	};
+	draw_rect(state, cursor_rect, (BVec4){.r = 200, .g = 200, .b = 200, .a = 150});
+
+	if (state->cur.clicked && pt_in_rect(state->cur.clicked_pos, cursor_rect)) {
+		state->seeking = true;
+	}
+	if (state->cur.is_down && state->seeking) {
+		float seek_perc = pan_delta.x / scrub_width;
+		int64_t watch_off_us = lerp(0.0, (double)pb->duration_us, seek_perc);
+
+		pb->start_time -= watch_off_us;
+	}
+	if (state->cur.up_now) {
+		state->seeking = false;
+	}
+
 	SDL_RenderPresent(state->renderer);
 
+	reset_cursor(&state->cur);
+	state->frame_count += 1;
 	return SDL_APP_CONTINUE;
 }
 
@@ -503,5 +593,5 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result) {
 	AppState *state = (AppState *)appstate;
 
 	quit = true;
-	pthread_join(state->decode_thread, NULL);
+	pthread_join(state->pb.decode_thread, NULL);
 }
