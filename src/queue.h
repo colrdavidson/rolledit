@@ -10,11 +10,10 @@ typedef struct {
 	pthread_mutex_t lock;
 } Queue;
 
-Queue queue_init(void) {
-	int64_t initial_size = 64;
+Queue queue_init(int64_t size) {
 	Queue q = (Queue){
-		.list = calloc(sizeof(void *), initial_size),
-		.size = initial_size,
+		.list = calloc(sizeof(void *), size),
+		.size = size,
 		.head = 0,
 		.tail = 0
 	};

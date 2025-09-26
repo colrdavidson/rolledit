@@ -12,7 +12,7 @@ typedef struct {
 	float y;
 	float w;
 	float h;
-} Rect;
+} FRect;
 
 typedef struct {
 	uint8_t r;
@@ -38,7 +38,7 @@ double lerp(double start, double end, double perc) {
 	return start + perc * (end - start);
 }
 
-bool pt_in_rect(FVec2 p, Rect r) {
+bool pt_in_rect(FVec2 p, FRect r) {
 	float x1 = r.x;
 	float y1 = r.y;
 	float x2 = r.x + r.w;
@@ -56,4 +56,32 @@ double distance(FVec2 a, FVec2 b) {
 
 FVec2 vec2_sub(FVec2 a, FVec2 b) {
 	return (FVec2){.x = a.x - b.x, .y = a.y - b.y};
+}
+
+static SDL_PixelFormat GetTextureFormat(enum AVPixelFormat format) {
+    switch (format) {
+    case AV_PIX_FMT_RGB8: return SDL_PIXELFORMAT_RGB332;
+    case AV_PIX_FMT_RGB444: return SDL_PIXELFORMAT_XRGB4444;
+    case AV_PIX_FMT_RGB555: return SDL_PIXELFORMAT_XRGB1555;
+    case AV_PIX_FMT_BGR555: return SDL_PIXELFORMAT_XBGR1555;
+    case AV_PIX_FMT_RGB565: return SDL_PIXELFORMAT_RGB565;
+    case AV_PIX_FMT_BGR565: return SDL_PIXELFORMAT_BGR565;
+    case AV_PIX_FMT_RGB24: return SDL_PIXELFORMAT_RGB24;
+    case AV_PIX_FMT_BGR24: return SDL_PIXELFORMAT_BGR24;
+    case AV_PIX_FMT_0RGB32: return SDL_PIXELFORMAT_XRGB8888;
+    case AV_PIX_FMT_0BGR32: return SDL_PIXELFORMAT_XBGR8888;
+    case AV_PIX_FMT_NE(RGB0, 0BGR): return SDL_PIXELFORMAT_RGBX8888;
+    case AV_PIX_FMT_NE(BGR0, 0RGB): return SDL_PIXELFORMAT_BGRX8888;
+    case AV_PIX_FMT_RGB32: return SDL_PIXELFORMAT_ARGB8888;
+    case AV_PIX_FMT_RGB32_1: return SDL_PIXELFORMAT_RGBA8888;
+    case AV_PIX_FMT_BGR32: return SDL_PIXELFORMAT_ABGR8888;
+    case AV_PIX_FMT_BGR32_1: return SDL_PIXELFORMAT_BGRA8888;
+    case AV_PIX_FMT_YUV420P: return SDL_PIXELFORMAT_IYUV;
+    case AV_PIX_FMT_YUYV422: return SDL_PIXELFORMAT_YUY2;
+    case AV_PIX_FMT_UYVY422: return SDL_PIXELFORMAT_UYVY;
+    case AV_PIX_FMT_NV12: return SDL_PIXELFORMAT_NV12;
+    case AV_PIX_FMT_NV21: return SDL_PIXELFORMAT_NV21;
+    case AV_PIX_FMT_P010: return SDL_PIXELFORMAT_P010;
+    default: return SDL_PIXELFORMAT_UNKNOWN;
+    }
 }

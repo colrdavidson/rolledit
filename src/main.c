@@ -16,11 +16,15 @@
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/time.h>
+#include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 
+
 #include "utils.h"
 #include "queue.h"
+
+#include <CoreVideo/CoreVideo.h>
 
 #define SDL_AUDIO_BUFFER_SIZE 1024
 
@@ -41,6 +45,10 @@ double p_height = 16;
 double em = 0;
 
 typedef struct {
+	enum AVPixelFormat pix_fmt;
+} VideoState;
+
+typedef struct {
 	int64_t pts_us;
 
 	uint8_t *data;
@@ -49,10 +57,7 @@ typedef struct {
 
 typedef struct {
 	int64_t  pts_us;
-
-	uint8_t *pixels;
-	uint8_t *buffers[4];
-	int      strides[4];
+	AVFrame *f;
 } Frame;
 
 typedef struct {
@@ -71,7 +76,8 @@ typedef struct {
 	double duration_us;
 	int64_t audio_idx;
 
-	SDL_Texture *vid_tex;
+	Frame *cur_frame;
+	SwsContext *sws_ctx;
 
 	int width;
 	int height;
@@ -115,10 +121,12 @@ typedef struct {
 	TTF_Font *sans_font;
 	TTF_Font *mono_font;
 	TTF_Font *icon_font;
+
+	SDL_Texture *sw_tex;
 } AppState;
 
 void free_frame(Frame *frame) {
-	free(frame->pixels);
+	av_frame_free(&frame->f);
 	free(frame);
 }
 
@@ -191,8 +199,44 @@ void audio_callback(void *userdata, SDL_AudioStream *stream, int additional, int
 	return;
 }
 
+enum AVPixelFormat get_hw_fmt(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
+	VideoState *vs = (VideoState *)ctx->opaque;
+	const enum AVPixelFormat *p;
+
+	for (p = pix_fmts; *p != -1; p++) { 
+		if (*p == vs->pix_fmt) {
+			return *p;
+		}
+	}
+
+	return AV_PIX_FMT_NONE;
+}
+
+bool find_hw_accel(const AVCodec *codec, enum AVHWDeviceType *hw_type, enum AVPixelFormat *hw_pix_fmt) {
+	enum AVHWDeviceType type = AV_HWDEVICE_TYPE_NONE;
+
+	while ((type = av_hwdevice_iterate_types(type)) != AV_HWDEVICE_TYPE_NONE) {
+		for (int i = 0;; i++) {
+
+			const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i);
+			if (!config) {
+				printf("HW decode accel for %s not found!\n", codec->name);
+				return false;
+			}
+
+			if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX & config->device_type == type) {
+				*hw_type = config->device_type;
+				*hw_pix_fmt = config->pix_fmt;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 void *decode_video(void *userdata) {
-	PlaybackState *pb = (PlaybackState *)userdata;
+	AppState *state = (AppState *)userdata;
+	PlaybackState *pb = &state->pb;
 
 	av_log_set_level(AV_LOG_QUIET);
 
@@ -247,10 +291,27 @@ void *decode_video(void *userdata) {
 		printf("Cannot find an video stream\n");
 		return NULL;
 	}
-	AVStream *video_stream = fmt_ctx->streams[video_stream_idx];
 
+	AVStream *video_stream = fmt_ctx->streams[video_stream_idx];
 	AVCodecContext *video_ctx = avcodec_alloc_context3(video_codec);
 	avcodec_parameters_to_context(video_ctx, video_stream->codecpar);
+
+	enum AVPixelFormat hw_pix_fmt;
+	enum AVHWDeviceType hw_type;
+	VideoState vs = {};
+	video_ctx->opaque = (void *)&vs;
+
+	AVBufferRef *hw_device_ctx = NULL;
+	if (find_hw_accel(video_codec, &hw_type, &hw_pix_fmt)) {
+		vs.pix_fmt = hw_pix_fmt;
+		video_ctx->get_format = get_hw_fmt;
+
+		if (av_hwdevice_ctx_create(&hw_device_ctx, hw_type, NULL, NULL, 0) < 0) {
+			printf("Failed to init hw decoder\n");
+			return NULL;
+		}
+		video_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+	}
 
 	if (avcodec_open2(video_ctx, video_codec, NULL) < 0) {
 		printf("could not open video codec\n");
@@ -259,11 +320,10 @@ void *decode_video(void *userdata) {
 	pb->frame_rate = av_q2d(video_stream->r_frame_rate);
 	pb->duration_us = ((double)fmt_ctx->duration / AV_TIME_BASE) * 1000000;
 
-	struct SwsContext *sws_ctx = sws_getContext(video_ctx->width, video_ctx->height, video_ctx->pix_fmt, pb->width, pb->height, pb->pix_fmt, SWS_LANCZOS, NULL, NULL, NULL);
+	pb->sws_ctx = sws_getContext(video_ctx->width, video_ctx->height, video_ctx->pix_fmt, pb->width, pb->height, pb->pix_fmt, SWS_LANCZOS, NULL, NULL, NULL);
 
 	AVPacket *pkt = av_packet_alloc();
 	AVFrame *frame = av_frame_alloc();
-
 	while (!quit) {
 		if (pb->should_seek) {
 			if (avformat_seek_file(fmt_ctx, -1, INT64_MIN, pb->seek_time, INT64_MAX, AVSEEK_FLAG_ANY) < 0) {
@@ -290,13 +350,13 @@ void *decode_video(void *userdata) {
 		}
 		if (pkt->stream_index == video_stream_idx) {
 			if (avcodec_send_packet(video_ctx, pkt) < 0) {
-				printf("Error sending video packet for decoding\n");
-				return NULL;
+				continue;
 			}
 
 			int ret = 0;
 			do {
-				ret = avcodec_receive_frame(video_ctx, frame);
+				AVFrame *video_frame = av_frame_alloc();
+				ret = avcodec_receive_frame(video_ctx, video_frame);
 				if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
 					break;
 				} else if (ret < 0) {
@@ -305,21 +365,18 @@ void *decode_video(void *userdata) {
 				}
 
 				int64_t pts = 0;
-				if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
-					pts = av_rescale_q(frame->best_effort_timestamp, video_stream->time_base, AV_TIME_BASE_Q);
+				if (video_frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+					pts = av_rescale_q(video_frame->best_effort_timestamp, video_stream->time_base, AV_TIME_BASE_Q);
 				}
 
-				int num_bytes = av_image_get_buffer_size(pb->pix_fmt, pb->width, pb->height, 1);
 				Frame *f = (Frame *)calloc(1, sizeof(Frame));
 				f->pts_us = pts;
-				f->pixels = malloc(num_bytes);
-
-				av_image_fill_arrays(f->buffers, f->strides, f->pixels, pb->pix_fmt, pb->width, pb->height, 1);
-				sws_scale(sws_ctx, (uint8_t const * const *)frame->data, frame->linesize, 0, video_ctx->height, f->buffers, f->strides);
+				f->f = video_frame;
 
 				while (!queue_push(&pb->frames, (void *)f) && !quit && !pb->should_seek) {
 					sleep_ns(10000);
 				}
+
 				if (quit) {
 					return NULL;
 				}
@@ -395,7 +452,7 @@ void *decode_video(void *userdata) {
 	return NULL;
 }
 
-void draw_rect(AppState *state, Rect r, BVec4 color) {
+void draw_rect(AppState *state, FRect r, BVec4 color) {
 	SDL_SetRenderDrawColor(state->renderer, color.r, color.g, color.b, color.a);
 
 	SDL_FRect rect = (SDL_FRect){
@@ -469,8 +526,6 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 	state->dpr = SDL_GetWindowDisplayScale(window);
 	em = p_height * state->dpr;
 
-	SDL_Texture *vid_tex = SDL_CreateTexture(state->renderer, SDL_PIXELFORMAT_YV12, SDL_TEXTUREACCESS_STREAMING, width, height);
-	SDL_SetTextureScaleMode(vid_tex, SDL_SCALEMODE_NEAREST);
 
 	state->sans_font = TTF_OpenFontIO(SDL_IOFromConstMem(sans_ttf, sizeof(sans_ttf)), true, em);
 	if (!state->sans_font) {
@@ -497,10 +552,8 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 		.height = height,
 		.pix_fmt = AV_PIX_FMT_YUV420P,
 
-		.vid_tex = vid_tex,
-
-		.frames = queue_init(),
-		.samples = queue_init(),
+		.frames = queue_init(32),
+		.samples = queue_init(64),
 
 		.pause = true,
 		.was_paused = true,
@@ -523,8 +576,10 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 
 	SDL_ResumeAudioStreamDevice(stream);
 
-	pthread_create(&state->pb.decode_thread, NULL, decode_video, (void *)&state->pb);
+	pthread_create(&state->pb.decode_thread, NULL, decode_video, (void *)state);
 	state->now = SDL_GetPerformanceCounter();
+	state->sw_tex = SDL_CreateTexture(state->renderer, SDL_PIXELFORMAT_YV12, SDL_TEXTUREACCESS_STREAMING, state->pb.width, state->pb.height);
+	SDL_SetTextureScaleMode(state->sw_tex, SDL_SCALEMODE_NEAREST);
 	*appstate = state;
 
 	return SDL_APP_CONTINUE;
@@ -584,6 +639,11 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
 			}
 			state->cur.pos = (FVec2){.x = x, .y = y};
 		} break;
+		case SDL_EVENT_KEY_DOWN: {
+			if (event->key.scancode == SDL_SCANCODE_SPACE) {
+				state->pb.pause = !state->pb.pause;
+			}
+		} break;
 	}
 
 	return SDL_APP_CONTINUE;
@@ -641,12 +701,64 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 	}
 
 	if (cur_frame && !pb->pause) {
-		SDL_UpdateYUVTexture(pb->vid_tex, NULL,
-			cur_frame->buffers[0], cur_frame->strides[0],
-			cur_frame->buffers[1], cur_frame->strides[1],
-			cur_frame->buffers[2], cur_frame->strides[2]
-		);
-		free_frame(cur_frame);
+		if (pb->cur_frame != NULL) {
+			free_frame(pb->cur_frame);
+		}
+		pb->cur_frame = cur_frame;
+	}
+
+	SDL_RenderClear(state->renderer);
+	SDL_FRect vid_tex_rect = (SDL_FRect){.x = 0, .y = 0, .w = pb->width, .h = pb->height};
+
+	if (pb->cur_frame) {
+		AVFrame *frame = pb->cur_frame->f;
+		if (frame->hw_frames_ctx) {
+			CVPixelBufferRef pix_buffer = (CVPixelBufferRef)frame->data[3];
+
+			AVHWFramesContext *frames = (AVHWFramesContext *)(frame->hw_frames_ctx->data);
+			int width = frames->width;
+			int height = frames->height;
+			SDL_PixelFormat format = GetTextureFormat(frames->sw_format);
+
+			SDL_PropertiesID props = SDL_CreateProperties();
+			SDL_Colorspace colorspace = SDL_DEFINE_COLORSPACE(SDL_COLOR_TYPE_YCBCR,
+															  frame->color_range,
+															  frame->color_primaries,
+															  frame->color_trc,
+															  frame->colorspace,
+															  frame->chroma_location);
+
+			SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_COLORSPACE_NUMBER, colorspace);
+			SDL_SetPointerProperty(props, SDL_PROP_TEXTURE_CREATE_METAL_PIXELBUFFER_POINTER, pix_buffer);
+			SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER, format);
+			SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, SDL_TEXTUREACCESS_STATIC);
+			SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, width);
+			SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, height);
+
+			SDL_Texture *tex = SDL_CreateTextureWithProperties(state->renderer, props);
+			SDL_DestroyProperties(props);
+			SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
+
+			SDL_RenderTexture(state->renderer, tex, NULL, &vid_tex_rect);
+			SDL_DestroyTexture(tex);
+		} else {
+			int num_bytes = av_image_get_buffer_size(pb->pix_fmt, pb->width, pb->height, 1);
+			uint8_t *pixels = malloc(num_bytes);
+			uint8_t *buffers[4] = {};
+			int strides[4] = {};
+
+			av_image_fill_arrays(buffers, strides, pixels, pb->pix_fmt, pb->width, pb->height, 1);
+			sws_scale(pb->sws_ctx, (uint8_t const * const *)frame->data, frame->linesize, 0, frame->height, buffers, strides);
+
+			SDL_UpdateYUVTexture(state->sw_tex, NULL,
+				buffers[0], strides[0],
+				buffers[1], strides[1],
+				buffers[2], strides[2]
+			);
+			free(pixels);
+
+			SDL_RenderTexture(state->renderer, state->sw_tex, NULL, &vid_tex_rect);
+		}
 	}
 
 	float scrub_start_x = pb->width / 4;
@@ -667,17 +779,12 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 	int64_t bytes_per_s = pb->sample_rate * sample_bytes * pb->channels;
 	double audio_clock_s = (double)pb->audio_idx / (double)bytes_per_s;
 
-	SDL_RenderClear(state->renderer);
-
-	SDL_FRect out_rect = (SDL_FRect){.x = 0, .y = 0, .w = pb->width, .h = pb->height};
-	SDL_RenderTexture(state->renderer, pb->vid_tex, NULL, &out_rect);
-
 	float bar_h = 4 * em;
 	float bar_y = pb->height - bar_h;
 	float scrub_height = em + (em / 2);
 	// bar background
 	draw_rect(state,
-		(Rect){.x = 0, .y = bar_y, .w = pb->width, .h = bar_h},
+		(FRect){.x = 0, .y = bar_y, .w = pb->width, .h = bar_h},
 		(BVec4){.r = 20, .g = 20, .b = 20, .a = 150}
 	);
 
@@ -685,12 +792,12 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 	float overlay_h = bar_h / 2;
 	// scrub overlay
 	draw_rect(state,
-		(Rect){.x = scrub_start_x, .y = bar_y + overlay_h, .w = scrub_width, .h = overlay_h},
+		(FRect){.x = scrub_start_x, .y = bar_y + overlay_h, .w = scrub_width, .h = overlay_h},
 		(BVec4){.r = 40, .g = 40, .b = 40, .a = 150}
 	);
 
 	// scrub cursor
-	Rect cursor_rect = (Rect){
+	FRect cursor_rect = (FRect){
 		.x = scrub_start_x + scrub_pos + (em / 4),
 		.y = overlay_y + (overlay_h / 2) - (scrub_height / 2),
 		.w = em,
@@ -711,7 +818,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 
 	float play_w = 2 * em;
 	float play_pad = em / 4;
-	Rect play_rect = (Rect){
+	FRect play_rect = (FRect){
 		.x = (pb->width / 2) - (play_w / 2) + play_pad,
 		.y = bar_y + play_pad,
 		.w = play_w - (2 * play_pad),
