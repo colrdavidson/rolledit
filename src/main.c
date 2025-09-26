@@ -63,6 +63,7 @@ typedef struct {
 	int64_t cur_time;
 
 	bool pause;
+	bool was_paused;
 	bool should_seek;
 	int64_t seek_time;
 
@@ -276,7 +277,9 @@ void *decode_video(void *userdata) {
 			flush_samples(&pb->samples);
 
 			pb->cur_time = pb->seek_time;
-			pb->pause = false;
+			if (!pb->was_paused) {
+				pb->pause = false;
+			}
 			pb->should_seek = false;
 		}
 
@@ -500,6 +503,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 		.samples = queue_init(),
 
 		.pause = true,
+		.was_paused = true,
 	};
 
 	SDL_AudioSpec specs = (SDL_AudioSpec){
@@ -720,6 +724,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 	);
 
 	if (state->cur.clicked && pt_in_rect(state->cur.clicked_pos, play_rect)) {
+		pb->was_paused = !pb->pause;
 		pb->pause = !pb->pause;
 	}
 
