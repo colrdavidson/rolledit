@@ -131,8 +131,7 @@ void audio_callback(void *userdata, SDL_AudioStream *stream, int additional, int
 		return;
 	}
 
-	int64_t cur_time_us = av_gettime();
-	int64_t rescaled_time_us = cur_time_us - pb->start_time;
+	int64_t cur_time = pb->cur_time;
 
 	// skip audio frames until we're at the closest one to presentation time
 	int64_t skip_count = 0;
@@ -141,7 +140,7 @@ void audio_callback(void *userdata, SDL_AudioStream *stream, int additional, int
 	pthread_mutex_lock(&pb->samples.lock);
 	while (queue_size_unsafe(&pb->samples) > 0) {
 		Sample *s = queue_peek_unsafe(&pb->samples);
-		if (s->pts_us <= rescaled_time_us) {
+		if (s->pts_us <= cur_time) {
 			if (cur_sample) {
 				skip_count += 1;
 				free_sample(cur_sample);
@@ -340,6 +339,11 @@ void *decode_video(void *userdata) {
 		} else {
 			av_packet_unref(pkt);
 		}
+
+/*
+		if (pb->seek_start) {
+		}
+*/
 	}
 	return NULL;
 }
@@ -405,7 +409,6 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 		printf("failed to init SDL_TTF\n");
 		return SDL_APP_FAILURE;
 	}
-
 
 	SDL_Window *window;
 	if (!SDL_CreateWindowAndRenderer("Viewer", width / 2, height / 2, SDL_WINDOW_HIGH_PIXEL_DENSITY, &window, &state->renderer)) {
@@ -473,10 +476,9 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 	SDL_ResumeAudioStreamDevice(stream);
 
 	pthread_create(&state->pb.decode_thread, NULL, decode_video, (void *)&state->pb);
-	state->pb.start_time = av_gettime();
+	state->now = SDL_GetPerformanceCounter();
 	*appstate = state;
 
-	state->pb.cur_time = av_gettime();
 	return SDL_APP_CONTINUE;
 }
 
@@ -547,9 +549,12 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 	AppState *state = (AppState *)appstate;
 	PlaybackState *pb = &state->pb;
 
-	uint64_t last = SDL_GetPerformanceCounter();
+	uint64_t last = state->now;
 	state->now = SDL_GetPerformanceCounter();
-	double dt = (double)((state->now - last) * 1000.0) / (double)SDL_GetPerformanceFrequency();
+	int64_t dt_us = (int64_t)((double)((state->now - last) * 1000000.0) / (double)SDL_GetPerformanceFrequency());
+	if (!pb->pause) {
+		pb->cur_time += dt_us;
+	}
 
 	bool panned = false;
 	if (state->cur.is_down || state->cur.up_now) {
@@ -564,11 +569,6 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 		pan_delta = vec2_sub(state->cur.pos, state->cur.last_pos);
 	}
 
-	if (!pb->pause) {
-		pb->cur_time = av_gettime();
-	}
-	int64_t rescaled_time_us = pb->cur_time - pb->start_time;
-
 	// skip video frames until we're at the closest one to presentation time
 	int64_t skip_count = 0;
 	Frame *cur_frame = NULL;
@@ -576,7 +576,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 	pthread_mutex_lock(&pb->frames.lock);
 	while (queue_size_unsafe(&pb->frames) > 0) {
 		Frame *f = (Frame *)queue_peek_unsafe(&pb->frames);
-		if (f->pts_us <= rescaled_time_us) {
+		if (f->pts_us <= pb->cur_time) {
 			if (cur_frame) {
 				skip_count += 1;
 				free_frame(cur_frame);
@@ -609,9 +609,9 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 	double scrub_pos = 0.0;
 	if (pb->frame_rate != 0 && pb->duration_us != 0) {
 		double us_per_frame = 1000000.0 / pb->frame_rate;
-		frame = (int64_t)((double)rescaled_time_us / us_per_frame);
+		frame = (int64_t)((double)pb->cur_time / us_per_frame);
 
-		double watch_perc = (double)rescaled_time_us / pb->duration_us;
+		double watch_perc = (double)pb->cur_time / pb->duration_us;
 		scrub_pos = lerp(0.0, scrub_width, watch_perc);
 	}
 
@@ -679,7 +679,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 		pb->pause = !pb->pause;
 	}
 
-	int64_t time_s = rescaled_time_us / 1000000;
+	int64_t time_s = pb->cur_time / 1000000;
 	int64_t disp_mins = time_s / 60;
 	int64_t disp_secs = time_s % 60;
 	char *time_str = NULL;
@@ -698,7 +698,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 		float seek_perc = pan_delta.x / scrub_width;
 		int64_t watch_off_us = lerp(0.0, (double)pb->duration_us, seek_perc);
 
-		pb->start_time -= watch_off_us;
+		pb->cur_time += watch_off_us;
 	}
 	if (state->cur.up_now) {
 		state->seeking = false;
