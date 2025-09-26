@@ -63,7 +63,9 @@ typedef struct {
 	int64_t cur_time;
 
 	bool pause;
-	int64_t start_time;
+	bool should_seek;
+	int64_t seek_time;
+
 	double frame_rate;
 	double duration_us;
 	int64_t audio_idx;
@@ -124,6 +126,24 @@ void free_sample(Sample *sample) {
 	free(sample);
 }
 
+void flush_frames(Queue *frames) {
+	pthread_mutex_lock(&frames->lock);
+	while (queue_size_unsafe(frames) > 0) {
+		Frame *tmp = (Frame *)queue_pop_unsafe(frames);
+		free_frame(tmp);
+	}
+	pthread_mutex_unlock(&frames->lock);
+}
+
+void flush_samples(Queue *samples) {
+	pthread_mutex_lock(&samples->lock);
+	while (queue_size_unsafe(samples) > 0) {
+		Sample *tmp = (Sample *)queue_pop_unsafe(samples);
+		free_sample(tmp);
+	}
+	pthread_mutex_unlock(&samples->lock);
+}
+
 void audio_callback(void *userdata, SDL_AudioStream *stream, int additional, int total) {
 	PlaybackState *pb = (PlaybackState *)userdata;
 
@@ -156,7 +176,7 @@ void audio_callback(void *userdata, SDL_AudioStream *stream, int additional, int
 	pthread_mutex_unlock(&pb->samples.lock);
 
 	if (skip_count > 0) {
-		printf("skipping %lld samples\n", skip_count);
+		//printf("skipping %lld samples\n", skip_count);
 	}
 
 	if (cur_sample) {
@@ -172,6 +192,8 @@ void audio_callback(void *userdata, SDL_AudioStream *stream, int additional, int
 
 void *decode_video(void *userdata) {
 	PlaybackState *pb = (PlaybackState *)userdata;
+
+	av_log_set_level(AV_LOG_QUIET);
 
 	AVFormatContext *fmt_ctx = NULL;
 	if (avformat_open_input(&fmt_ctx, pb->filename, NULL, NULL) < 0) {
@@ -224,7 +246,6 @@ void *decode_video(void *userdata) {
 		printf("Cannot find an video stream\n");
 		return NULL;
 	}
-
 	AVStream *video_stream = fmt_ctx->streams[video_stream_idx];
 
 	AVCodecContext *video_ctx = avcodec_alloc_context3(video_codec);
@@ -241,7 +262,29 @@ void *decode_video(void *userdata) {
 
 	AVPacket *pkt = av_packet_alloc();
 	AVFrame *frame = av_frame_alloc();
-	while (av_read_frame(fmt_ctx, pkt) >= 0 && !quit) {
+
+	while (!quit) {
+		if (pb->should_seek) {
+			if (avformat_seek_file(fmt_ctx, -1, INT64_MIN, pb->seek_time, INT64_MAX, AVSEEK_FLAG_ANY) < 0) {
+				printf("failed to seek in file?\n");
+				return NULL;
+			}
+			avcodec_flush_buffers(video_ctx);
+			avcodec_flush_buffers(audio_ctx);
+
+			flush_frames(&pb->frames);
+			flush_samples(&pb->samples);
+
+			pb->cur_time = pb->seek_time;
+			pb->pause = false;
+			pb->should_seek = false;
+		}
+
+		int read_ret = av_read_frame(fmt_ctx, pkt);
+		if (read_ret < 0) {
+			sleep_ns(1000);
+			continue;
+		}
 		if (pkt->stream_index == video_stream_idx) {
 			if (avcodec_send_packet(video_ctx, pkt) < 0) {
 				printf("Error sending video packet for decoding\n");
@@ -271,11 +314,14 @@ void *decode_video(void *userdata) {
 				av_image_fill_arrays(f->buffers, f->strides, f->pixels, pb->pix_fmt, pb->width, pb->height, 1);
 				sws_scale(sws_ctx, (uint8_t const * const *)frame->data, frame->linesize, 0, video_ctx->height, f->buffers, f->strides);
 
-				while (!queue_push(&pb->frames, (void *)f) && !quit) {
+				while (!queue_push(&pb->frames, (void *)f) && !quit && !pb->should_seek) {
 					sleep_ns(10000);
 				}
 				if (quit) {
 					return NULL;
+				}
+				if (pb->should_seek) {
+					break;
 				}
 			} while (ret >= 0);
 		} else if (pkt->stream_index == audio_stream_idx) {
@@ -329,21 +375,19 @@ void *decode_video(void *userdata) {
 					.pts_us = pts
 				};
 
-				while (!queue_push(&pb->samples, (void *)s) && !quit) {
+				while (!queue_push(&pb->samples, (void *)s) && !quit && !pb->should_seek) {
 					sleep_ns(10000);
 				}
 				if (quit) {
 					return NULL;
 				}
+				if (pb->should_seek) {
+					break;
+				}
 			} while (ret >= 0);
 		} else {
 			av_packet_unref(pkt);
 		}
-
-/*
-		if (pb->seek_start) {
-		}
-*/
 	}
 	return NULL;
 }
@@ -553,7 +597,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 	state->now = SDL_GetPerformanceCounter();
 	int64_t dt_us = (int64_t)((double)((state->now - last) * 1000000.0) / (double)SDL_GetPerformanceFrequency());
 	if (!pb->pause) {
-		pb->cur_time += dt_us;
+		pb->cur_time = CLAMP(pb->cur_time + dt_us, 0, pb->duration_us);
 	}
 
 	bool panned = false;
@@ -589,7 +633,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 	pthread_mutex_unlock(&pb->frames.lock);
 
 	if (skip_count > 0) {
-		printf("skipping %lld frames\n", skip_count);
+		//printf("skipping %lld frames\n", skip_count);
 	}
 
 	if (cur_frame && !pb->pause) {
@@ -691,17 +735,22 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 		color_white
 	);
 
-	if (state->cur.clicked && pt_in_rect(state->cur.clicked_pos, cursor_rect)) {
+	if (state->cur.clicked && pt_in_rect(state->cur.clicked_pos, cursor_rect) && !state->seeking) {
 		state->seeking = true;
+		pb->pause = true;
+		pb->seek_time = pb->cur_time;
 	}
 	if (state->cur.is_down && state->seeking) {
 		float seek_perc = pan_delta.x / scrub_width;
 		int64_t watch_off_us = lerp(0.0, (double)pb->duration_us, seek_perc);
 
-		pb->cur_time += watch_off_us;
+		int64_t new_time = CLAMP(pb->cur_time + watch_off_us, 0, pb->duration_us);
+		pb->seek_time = new_time;
+		pb->cur_time  = new_time;
 	}
-	if (state->cur.up_now) {
+	if (state->cur.up_now && state->seeking) {
 		state->seeking = false;
+		pb->should_seek = true;
 	}
 
 	SDL_RenderPresent(state->renderer);

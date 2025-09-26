@@ -4,6 +4,7 @@
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define CLAMP(x, min, max) ((x) < (min) ? (min) : ((x) > (max) ? (max) : (x)))
 #define ELEM_COUNT(x) (sizeof(x) / (sizeof((x)[0])))
 
 typedef struct {
