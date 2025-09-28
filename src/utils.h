@@ -7,6 +7,8 @@
 #define CLAMP(x, min, max) ((x) < (min) ? (min) : ((x) > (max) ? (max) : (x)))
 #define ELEM_COUNT(x) (sizeof(x) / (sizeof((x)[0])))
 
+#define RAT_TO_STRS(x) (x).num, (x).den
+
 typedef struct {
 	float x;
 	float y;
