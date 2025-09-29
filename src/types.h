@@ -1,5 +1,8 @@
 #pragma once
 
+double p_height = 16;
+double em = 0;
+
 typedef struct {
 	bool clicked;
 	bool is_down;
@@ -15,7 +18,7 @@ typedef struct {
 
 typedef struct {
 	enum AVPixelFormat pix_fmt;
-} VideoState;
+} HWState;
 
 typedef struct {
 	int64_t pts_us;
@@ -30,23 +33,39 @@ typedef struct {
 } Frame;
 
 typedef struct {
+	char *file_path;
+
+	int64_t duration_us;
+
+	AVFormatContext *fmt_ctx;
+	SwsContext *sws_ctx;
+	SwrContext *swr;
+
+	AVCodecContext *video_ctx;
+	int video_stream_idx;
+	AVStream *video_stream;
+
+	AVCodecContext *audio_ctx;
+	int audio_stream_idx;
+	AVStream *audio_stream;
+} ClipState;
+
+typedef struct {
 	pthread_t decode_thread;
 
-	char *filename;
+	ClipState *clips;
+	int clip_count;
+	bool clips_loaded;
 
-	int64_t cur_time;
+	int64_t cur_time_us;
+	int64_t seek_time_us;
 
 	bool pause;
 	bool was_paused;
 	bool should_seek;
-	int64_t seek_time;
-
-	double frame_rate;
-	double duration_us;
-	int64_t audio_idx;
+	bool done_seeking;
 
 	Frame *cur_frame;
-	SwsContext *sws_ctx;
 
 	int width;
 	int height;
@@ -63,8 +82,10 @@ typedef struct {
 typedef struct {
 	pthread_t transcode_thread;
 
-	char *in_filename;
-	char *out_filename;
+	char *in_file_path;
+	char *out_file_path;
+
+	int64_t cur_time_us;
 } TranscodeState;
 
 typedef struct {
@@ -81,6 +102,10 @@ typedef struct {
 	double dpr;
 
 	Cursor cur;
+
+	bool start_transcode;
+	bool transcoding;
+	bool done_transcoding;
 
 	bool seeking;
 

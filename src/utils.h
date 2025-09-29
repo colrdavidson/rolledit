@@ -28,8 +28,6 @@ typedef struct {
 	float y;
 } FVec2;
 
-BVec4 color_white = {.r = 255, .g = 255, .b = 255, .a = 255};
-
 void sleep_ns(uint64_t ns) {
 	struct timespec requested_time = (struct timespec){.tv_nsec = ns};
 	struct timespec remaining_time = {};
@@ -86,4 +84,17 @@ static SDL_PixelFormat GetTextureFormat(enum AVPixelFormat format) {
     case AV_PIX_FMT_P010: return SDL_PIXELFORMAT_P010;
     default: return SDL_PIXELFORMAT_UNKNOWN;
     }
+}
+
+char *shortname(char *full_path) {
+	char *name = strrchr(full_path, '/');
+	return name + 1;
+}
+
+char *secs_to_timestr(int64_t secs) {
+	int64_t disp_mins = secs / 60;
+	int64_t disp_secs = secs % 60;
+	char *time_str = NULL;
+	asprintf(&time_str, "%02lld:%02lld", disp_mins, disp_secs);
+	return time_str;
 }

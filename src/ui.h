@@ -1,5 +1,15 @@
 #pragma once
 
+#include <CoreVideo/CoreVideo.h>
+
+BVec4 color_white = {.r = 255, .g = 255, .b = 255, .a = 255};
+BVec4 color_black = {.r = 0, .g = 0, .b = 0, .a = 255};
+
+BVec4 color_green  = {.r = 0,   .g = 155, .b = 53, .a = 255};
+BVec4 color_blue   = {.r = 0,   .g = 121, .b = 155, .a = 255};
+BVec4 color_purple = {.r = 85,  .g =   0, .b = 200, .a = 255};
+BVec4 color_orange = {.r = 170, .g =  77, .b =  54, .a = 255};
+
 void draw_rect(AppState *state, FRect r, BVec4 color) {
 	SDL_SetRenderDrawColor(state->renderer, color.r, color.g, color.b, color.a);
 
@@ -10,6 +20,13 @@ void draw_rect(AppState *state, FRect r, BVec4 color) {
 		.h = r.h
 	};
 	SDL_RenderFillRect(state->renderer, &rect);
+}
+
+float r_end_x(FRect r) {
+	return r.x + r.w;
+}
+float r_end_y(FRect r) {
+	return r.y + r.h;
 }
 
 int64_t measure_text(TTF_Font *font, char *str) {
@@ -32,8 +49,8 @@ void draw_text(AppState *state, TTF_Font *font, char *str, FVec2 pos, BVec4 colo
 	float h = 0;
 	SDL_GetTextureSize(text_tex, &w, &h);
 	SDL_FRect rect = (SDL_FRect){
-		.x = pos.x,
-		.y = pos.y,
+		.x = (float)(int)pos.x,
+		.y = (float)(int)pos.y,
 		.w = w,
 		.h = h
 	};
