@@ -23,6 +23,7 @@
 #include <libswresample/swresample.h>
 
 #include "utils.h"
+#include "dynarr.h"
 #include "queue.h"
 #include "types.h"
 #include "ui.h"
@@ -145,18 +146,18 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 	}
 	TTF_SetFontHinting(state->sans_font, TTF_HINTING_NORMAL);
 
-	ClipState *clips = calloc(sizeof(ClipState), 2);
-	clips[0] = (ClipState){
+	dyn_init(&state->clips, 8);
+	dyn_append(&state->clips, ((ClipState){
 		.file_path = file_path,
-	};
-	clips[1] = (ClipState){
+	}));
+	dyn_append(&state->clips, ((ClipState){
 		.file_path = file_path,
-	};
+	}));
+	dyn_append(&state->clips, ((ClipState){
+		.file_path = file_path,
+	}));
 
 	state->pb = (PlaybackState){
-		.clips = clips,
-		.clip_count = 2,
-
 		.width = width,
 		.height = height,
 		.pix_fmt = AV_PIX_FMT_YUV420P,
@@ -199,9 +200,17 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 
 	char *out_file_path = realpath("test.mp4", NULL);
 	state->tr = (TranscodeState){
-		.in_file_path = file_path,
 		.out_file_path = out_file_path,
+
+		.width = width,
+		.height = height,
+		.pix_fmt = AV_PIX_FMT_YUV420P,
+
+		.sample_rate = 48000,
+		.channels = 2,
+		.sample_fmt = AV_SAMPLE_FMT_FLTP,
 	};
+	av_channel_layout_default(&state->tr.ch_layout, state->tr.channels);
 	pthread_create(&state->tr.transcode_thread, NULL, transcode_video_thread, (void *)state);
 
 	return SDL_APP_CONTINUE;
@@ -287,15 +296,15 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 	int64_t total_duration_us = 0;
 	int64_t cur_clip_offset_us = 0;
 	if (pb->clips_loaded) {
-		for (int i = 0; i < pb->clip_count; i++) {
-			total_duration_us += pb->clips[i].duration_us;
+		for (int i = 0; i < state->clips.size; i++) {
+			total_duration_us += dyn_get(&state->clips, i).duration_us;
 		}
 
 		if (!pb->pause) {
 			pb->cur_time_us = CLAMP(pb->cur_time_us + dt_us, 0, total_duration_us);
 		}
 
-		cur_clip = get_clip(pb, pb->cur_time_us, &cur_clip_offset_us);
+		cur_clip = get_clip(state, pb->cur_time_us, &cur_clip_offset_us);
 	}
 	int64_t total_duration_s = (double)total_duration_us / 1000000.0;
 
@@ -388,7 +397,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 				int strides[4] = {};
 
 				av_image_fill_arrays(buffers, strides, pixels, pb->pix_fmt, pb->width, pb->height, 1);
-				sws_scale(cur_clip->sws_ctx, (uint8_t const * const *)frame->data, frame->linesize, 0, frame->height, buffers, strides);
+				sws_scale(cur_clip->ps.sws_ctx, (uint8_t const * const *)frame->data, frame->linesize, 0, frame->height, buffers, strides);
 
 				SDL_UpdateYUVTexture(state->sw_tex, NULL,
 					buffers[0], strides[0],
@@ -576,8 +585,8 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 		color_orange
 	};
 
-	for (int i = 0; i < pb->clip_count; i++) {
-		ClipState *clip = &pb->clips[i];
+	for (int i = 0; i < state->clips.size; i++) {
+		ClipState *clip = &dyn_get(&state->clips, i);
 
 		char *filename = shortname(clip->file_path);
 		int64_t name_w = measure_text(state->sans_font, filename);
@@ -629,7 +638,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 			.h = progress_bar_h
 		}, (BVec4){.r = 10, .g = 10, .b = 10, .a = 255});
 
-		float progress_perc = state->tr.cur_time_us / total_duration_us;
+		float progress_perc = (double)state->tr.cur_time_us / (double)total_duration_us;
 		float progress_w = lerp(progress_bar_start_x, progress_bar_end_x, progress_perc);
 
 		// Draw progress bar
